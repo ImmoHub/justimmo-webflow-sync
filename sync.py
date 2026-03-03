@@ -53,7 +53,15 @@ TYPE_IDS = {
     "Garage": "69a6ee2886f3814c85c35c8e",
     "Zinshaus": "69a6ee2a66a4105527ae01a0",
 }
-DEFAULT_AGENT_ID = "69a6ee9c6ee9509b8be4d895"  # Mag.(FH) Harald Grassler
+DEFAULT_AGENT_ID = "69a6ee9c6ee9509b8be4d895"  # Mag.(FH) Harald Grassler (Fallback)
+
+# Justimmo-Agenten-ID → Webflow-Agenten-ID Mapping
+JUSTIMMO_AGENT_MAPPING = {
+    "2009026":  "69a6ee9c6ee9509b8be4d895",  # Mag.(FH) Harald Grassler
+    "26293524": "69a6ee9e982c3f7f3c614e9a",  # Mag. Sascha Nevoral
+    "16385723": "69a6eea0f083679bed8045a9",  # Mario Schmid
+    "22260941": "69a6eea3f9234d30c8dc0c9d",  # Nataliya Schweda
+}
 
 # PLZ → Bundesland Mapping
 PLZ_BUNDESLAND = {}
@@ -314,6 +322,14 @@ def parse_justimmo_item(root, justimmo_id):
     data['latitude-4'] = lat
     data['longitude-3'] = lon
 
+    # Agent aus Kontaktperson
+    kontakt = root.find('.//kontaktperson')
+    if kontakt is not None:
+        agent_justimmo_id = kontakt.findtext('id', '').strip()
+        data['_agent_justimmo_id'] = agent_justimmo_id
+    else:
+        data['_agent_justimmo_id'] = ''
+
     return data
 
 
@@ -386,7 +402,7 @@ def build_webflow_payload(data):
         "aufzug": data.get('aufzug', False),
         "barrierefrei": data.get('barrierefrei', False),
         "terrasse-balkon": data.get('terrasse-balkon', False),
-        "agent-detail": DEFAULT_AGENT_ID,
+        "agent-detail": JUSTIMMO_AGENT_MAPPING.get(data.get('_agent_justimmo_id', ''), DEFAULT_AGENT_ID),
         "property-locations": bundesland_id,
         "property-categories": kategorie_id,
         "property-type": typ_id,
