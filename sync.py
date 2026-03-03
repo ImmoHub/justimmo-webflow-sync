@@ -445,6 +445,53 @@ def publish_site():
     log.info(f"Site-Publish: {resp.status_code}")
 
 
+AGENTS_COLLECTION_ID = "699f29e03ecf1945550ca38b"
+
+# Webflow-Agenten-ID → Justimmo-Agenten-ID (umgekehrtes Mapping)
+WEBFLOW_TO_JUSTIMMO_AGENT = {v: k for k, v in JUSTIMMO_AGENT_MAPPING.items()}
+
+
+def update_agent_listings(all_webflow_items):
+    """Agenten-Objekte-Feld (agent-listings) mit den richtigen Immobilien befüllen."""
+    log.info("\n[6/6] Aktualisiere Agenten-Objekte-Zuordnung...")
+
+    # Immobilien nach Agenten gruppieren
+    agent_to_items = {agent_id: [] for agent_id in JUSTIMMO_AGENT_MAPPING.values()}
+
+    for item in all_webflow_items:
+        fd = item.get('fieldData', {})
+        agent_id = fd.get('agent-detail', '')
+        if agent_id in agent_to_items:
+            agent_to_items[agent_id].append(item['id'])
+
+    # Jeden Agenten aktualisieren
+    for webflow_agent_id, property_ids in agent_to_items.items():
+        agent_name = next(
+            (item.get('fieldData', {}).get('name', '') 
+             for item in [] if item.get('id') == webflow_agent_id),
+            webflow_agent_id
+        )
+        log.info(f"  Agent {webflow_agent_id}: {len(property_ids)} Objekte")
+
+        url = f"https://api.webflow.com/v2/collections/{AGENTS_COLLECTION_ID}/items/{webflow_agent_id}"
+        resp = requests.patch(
+            url,
+            headers=WEBFLOW_HEADERS,
+            json={"fieldData": {"agent-listings": property_ids}}
+        )
+        if resp.status_code == 200:
+            log.info(f"    ✓ {len(property_ids)} Objekte gesetzt")
+        else:
+            log.error(f"    ✗ Fehler {resp.status_code}: {resp.json().get('message', '')}")
+        time.sleep(0.3)
+
+    # Agenten publizieren
+    agent_ids = list(JUSTIMMO_AGENT_MAPPING.values())
+    pub_url = f"https://api.webflow.com/v2/collections/{AGENTS_COLLECTION_ID}/items/publish"
+    resp = requests.post(pub_url, headers=WEBFLOW_HEADERS, json={"itemIds": agent_ids})
+    log.info(f"  Agenten publiziert: {resp.status_code}")
+
+
 # ============================================================
 # HAUPTPROGRAMM
 # ============================================================
@@ -537,6 +584,10 @@ def main():
     log.info(f"\nPubliziere {len(published_ids)} Items...")
     if published_ids:
         publish_all_items(published_ids)
+
+    # Agenten-Objekte aktualisieren (alle aktuellen Webflow-Items neu laden)
+    all_current_items = get_all_webflow_items()
+    update_agent_listings(all_current_items)
 
     log.info("\nPubliziere Site...")
     publish_site()
