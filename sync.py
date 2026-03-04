@@ -1,606 +1,654 @@
 #!/usr/bin/env python3
 """
-Justimmo → Webflow CMS Vollständiger Sync
-==========================================
-- Neue Immobilien von Justimmo in Webflow anlegen
-- Bestehende Immobilien aktualisieren
-- Nicht mehr aktive Immobilien in Webflow archivieren
-- Koordinaten von Justimmo Detail-API holen
-- Site nach dem Sync publizieren
+Justimmo → Webflow CMS Synchronisation
+=======================================
+Liest alle aktiven Immobilien von der Justimmo API und importiert/aktualisiert
+sie vollständig in die Webflow CMS Collections.
 
-Credentials werden über Umgebungsvariablen geladen (GitHub Secrets).
+Unterstützte Collections:
+  - Immobilien (Properties)        → Hauptobjekte
+  - Immobilientypen (Propert Types)
+  - Kategorien (Property Categories)
+  - Standorte (Property Locations)
+  - Makler (Agents)
+
+Verwendung:
+  python3 sync.py                  # Vollsynchronisation
+  python3 sync.py --dry-run        # Nur anzeigen, nichts schreiben
+  python3 sync.py --limit 10       # Nur 10 Objekte synchronisieren
 """
 
-import requests
-import xml.etree.ElementTree as ET
-from requests.auth import HTTPBasicAuth
-import json
-import time
-import re
 import os
-import unicodedata
+import sys
+import time
 import logging
-from datetime import datetime
+import argparse
+import unicodedata
+import re
+import xml.etree.ElementTree as ET
+from typing import Optional
 
-# === KONFIGURATION (aus Umgebungsvariablen / GitHub Secrets) ===
-JUSTIMMO_USER = os.environ.get("JUSTIMMO_USER", "api-97120")
-JUSTIMMO_PASS = os.environ.get("JUSTIMMO_PASS", "cScKIP9TW2")
-WEBFLOW_TOKEN = os.environ.get("WEBFLOW_TOKEN", "73a9946918ef8550ec737f53f55f350cc919a51c6c9031bf44e37c6956ea1026")
-SITE_ID = "699f29df3ecf1945550ca280"
-COLLECTION_ID = "699f29e03ecf1945550ca36c"
+import requests
 
-# Reference-Collection IDs
-LOCATIONS_COLLECTION = "699f29e03ecf1945550ca3c6"
-CATEGORIES_COLLECTION = "699f29e03ecf1945550ca3da"
-TYPES_COLLECTION = "699f29e03ecf1945550ca3e1"
+# ─────────────────────────────────────────────
+# Konfiguration
+# ─────────────────────────────────────────────
+JUSTIMMO_USER     = os.getenv("JUSTIMMO_USER", "api-871120")
+JUSTIMMO_PASS     = os.getenv("JUSTIMMO_PASS", "")          # Aus .env oder Umgebungsvariable
+JUSTIMMO_BASE     = "https://api.justimmo.at/rest/v1"
+JUSTIMMO_PICSIZE  = "big"                                    # Bildgröße: small | medium | big
 
-# Webflow Reference IDs
-BUNDESLAND_IDS = {
-    "Wien": "69a751b3ea56691dccd98f51",
-    "Niederösterreich": "69a751b5aa6d0c9cd0d5fdc7",
-    "Burgenland": "69a751b6a03eccfbf22f310f",
-}
-CATEGORY_IDS = {
-    "Kaufen": "69a6ee19bfda0586db78646e",
-    "Mieten": "69a6ee1b7beef16b60ce3d67",
-    "Anlage": "69a6ee1d86f3814c85c3540c",
-}
-TYPE_IDS = {
-    "Wohnung": "69a6ee204444a16a1df33299",
-    "Haus": "69a6ee224e886d72629ca282",
-    "Grundstück": "69a6ee24f9234d30c8dbb6f2",
-    "Gewerbe": "69a6ee264e886d72629ca566",
-    "Garage": "69a6ee2886f3814c85c35c8e",
-    "Zinshaus": "69a6ee2a66a4105527ae01a0",
-}
-DEFAULT_AGENT_ID = "69a6ee9c6ee9509b8be4d895"  # Mag.(FH) Harald Grassler (Fallback)
+WEBFLOW_TOKEN     = os.getenv("WEBFLOW_TOKEN", "8424b93453944e22efb0d92da7e802f9011156a5d6109d4748eb7ec3097b8b7c")
+WEBFLOW_BASE      = "https://api.webflow.com/v2"
+WEBFLOW_SITE_ID   = "699f29df3ecf1945550ca280"
 
-# Justimmo-Agenten-ID → Webflow-Agenten-ID Mapping
-JUSTIMMO_AGENT_MAPPING = {
-    "2009026":  "69a6ee9c6ee9509b8be4d895",  # Mag.(FH) Harald Grassler
-    "26293524": "69a6ee9e982c3f7f3c614e9a",  # Mag. Sascha Nevoral
-    "16385723": "69a6eea0f083679bed8045a9",  # Mario Schmid
-    "22260941": "69a6eea3f9234d30c8dc0c9d",  # Nataliya Schweda
-}
+# Collection IDs
+COL_PROPERTIES    = "699f29e03ecf1945550ca36c"
+COL_AGENTS        = "699f29e03ecf1945550ca38b"
+COL_LOCATIONS     = "699f29e03ecf1945550ca3c6"
+COL_CATEGORIES    = "699f29e03ecf1945550ca3da"
+COL_TYPES         = "699f29e03ecf1945550ca3e1"
 
-# PLZ → Bundesland Mapping
-PLZ_BUNDESLAND = {}
-for plz in range(1010, 1240):
-    PLZ_BUNDESLAND[str(plz)] = "Wien"
-for plz in range(2000, 3999):
-    PLZ_BUNDESLAND[str(plz)] = "Niederösterreich"
-for plz in range(7000, 7999):
-    PLZ_BUNDESLAND[str(plz)] = "Burgenland"
+# Rate-Limiting: Webflow erlaubt 60 Requests/Minute
+WEBFLOW_RATE_DELAY = 1.1  # Sekunden zwischen Requests
 
+# ─────────────────────────────────────────────
 # Logging
+# ─────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
+    format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler('/tmp/justimmo_sync.log'),
-        logging.StreamHandler()
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("sync.log", encoding="utf-8"),
     ]
 )
 log = logging.getLogger(__name__)
 
-WEBFLOW_HEADERS = {
-    "Authorization": f"Bearer {WEBFLOW_TOKEN}",
-    "accept-version": "1.0.0",
-    "Content-Type": "application/json"
-}
+
+# ─────────────────────────────────────────────
+# Hilfsfunktionen
+# ─────────────────────────────────────────────
+def slugify(text: str) -> str:
+    """Erstellt einen URL-sicheren Slug aus einem beliebigen Text."""
+    text = str(text).lower().strip()
+    text = unicodedata.normalize("NFKD", text)
+    text = text.encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[\s_-]+", "-", text)
+    text = re.sub(r"^-+|-+$", "", text)
+    return text or "objekt"
 
 
-# ============================================================
-# JUSTIMMO API
-# ============================================================
-
-def get_justimmo_all_ids():
-    ids = []
-    offset = 0
-    limit = 100
-    while True:
-        url = f"https://api.justimmo.at/rest/v1/objekt/list?limit={limit}&offset={offset}"
-        resp = requests.get(url, auth=HTTPBasicAuth(JUSTIMMO_USER, JUSTIMMO_PASS), timeout=30)
-        if resp.status_code != 200:
-            log.error(f"Justimmo List API Fehler: {resp.status_code}")
-            break
-        root = ET.fromstring(resp.content)
-        batch = [el.text.strip() for el in root.findall('.//immobilie/id') if el.text]
-        ids.extend(batch)
-        if len(batch) < limit:
-            break
-        offset += limit
-        time.sleep(0.5)
-    return ids
+def xml_text(element, path: str, default: str = "") -> str:
+    """Liest den Textinhalt eines XML-Elements sicher aus."""
+    node = element.find(path)
+    if node is not None and node.text:
+        return node.text.strip()
+    return default
 
 
-def get_justimmo_detail(justimmo_id):
-    url = f"https://api.justimmo.at/rest/v1/objekt/detail?objekt_id={justimmo_id}"
+def xml_float(element, path: str, default: float = 0.0) -> float:
+    """Liest einen Float-Wert aus einem XML-Element."""
+    val = xml_text(element, path)
     try:
-        resp = requests.get(url, auth=HTTPBasicAuth(JUSTIMMO_USER, JUSTIMMO_PASS), timeout=30)
-        if resp.status_code != 200:
-            return None
+        return float(val.replace(",", "."))
+    except (ValueError, AttributeError):
+        return default
+
+
+# ─────────────────────────────────────────────
+# Justimmo API Client
+# ─────────────────────────────────────────────
+class JustimmoClient:
+    def __init__(self, user: str, password: str):
+        self.session = requests.Session()
+        self.session.auth = (user, password)
+        self.session.headers.update({"Accept": "application/xml"})
+
+    def get(self, endpoint: str, params: dict = None) -> ET.Element:
+        url = f"{JUSTIMMO_BASE}/{endpoint}"
+        resp = self.session.get(url, params=params, timeout=30)
+        resp.raise_for_status()
         return ET.fromstring(resp.content)
-    except Exception as e:
-        log.error(f"Justimmo Detail Fehler für ID {justimmo_id}: {e}")
-        return None
+
+    def get_all_ids(self) -> list[str]:
+        """Ruft alle Immobilien-IDs ab (ohne Limit)."""
+        root = self.get("objekt/ids")
+        # Antwort ist ein JSON-Array als Text, aber wir parsen XML-Wrapper
+        # Alternativ direkt als JSON
+        url = f"{JUSTIMMO_BASE}/objekt/ids"
+        resp = self.session.get(url, timeout=30)
+        resp.raise_for_status()
+        try:
+            ids = resp.json()
+            return [str(i) for i in ids]
+        except Exception:
+            # Fallback: XML parsen
+            root = ET.fromstring(resp.content)
+            return [node.text for node in root.findall(".//id") if node.text]
+
+    def get_realty_list(self, limit: int = 100, offset: int = 0) -> ET.Element:
+        """Ruft eine paginierte Liste von Immobilien ab."""
+        return self.get("objekt/list", {
+            "limit": limit,
+            "offset": offset,
+            "showDetails": 1,
+            "picturesize": JUSTIMMO_PICSIZE,
+            "culture": "de",
+        })
+
+    def get_realty_detail(self, objekt_id: str) -> ET.Element:
+        """Ruft die Detailansicht einer einzelnen Immobilie ab."""
+        return self.get("objekt/detail", {
+            "objekt_id": objekt_id,
+            "picturesize": JUSTIMMO_PICSIZE,
+            "culture": "de",
+        })
+
+    def get_all_realties(self, max_items: int = None) -> list[ET.Element]:
+        """Ruft alle Immobilien paginiert ab."""
+        all_realties = []
+        offset = 0
+        batch = 100
+
+        log.info("Starte Abruf aller Immobilien von Justimmo...")
+        while True:
+            root = self.get_realty_list(limit=batch, offset=offset)
+            count_node = root.find(".//count")
+            total = int(count_node.text) if count_node is not None else 0
+
+            realties = root.findall(".//immobilie")
+            if not realties:
+                break
+
+            all_realties.extend(realties)
+            log.info(f"  Abgerufen: {len(all_realties)}/{total}")
+
+            if max_items and len(all_realties) >= max_items:
+                all_realties = all_realties[:max_items]
+                break
+
+            if len(all_realties) >= total:
+                break
+
+            offset += batch
+            time.sleep(0.5)
+
+        log.info(f"Gesamt abgerufen: {len(all_realties)} Immobilien")
+        return all_realties
 
 
-def get_field(root, feldname):
-    for el in root.iter('user_defined_simplefield'):
-        if el.get('feldname') == feldname and el.text:
-            return el.text.strip()
-    return ''
+# ─────────────────────────────────────────────
+# Webflow API Client
+# ─────────────────────────────────────────────
+class WebflowClient:
+    def __init__(self, token: str):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "accept-version": "1.0.0",
+        })
+        self._last_request = 0.0
+
+    def _throttle(self):
+        """Rate-Limiting: max. 60 Requests/Minute."""
+        elapsed = time.time() - self._last_request
+        if elapsed < WEBFLOW_RATE_DELAY:
+            time.sleep(WEBFLOW_RATE_DELAY - elapsed)
+        self._last_request = time.time()
+
+    def get_collection_items(self, collection_id: str) -> list[dict]:
+        """Liest alle vorhandenen Items einer Collection aus."""
+        items = []
+        offset = 0
+        while True:
+            self._throttle()
+            resp = self.session.get(
+                f"{WEBFLOW_BASE}/collections/{collection_id}/items",
+                params={"limit": 100, "offset": offset}
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            batch = data.get("items", [])
+            items.extend(batch)
+            if len(items) >= data.get("pagination", {}).get("total", 0):
+                break
+            if not batch:
+                break
+            offset += 100
+        return items
+
+    def create_item(self, collection_id: str, field_data: dict, dry_run: bool = False) -> Optional[dict]:
+        """Erstellt ein neues CMS-Item."""
+        if dry_run:
+            log.info(f"  [DRY-RUN] Würde erstellen: {field_data.get('name', '?')}")
+            return {"id": "dry-run"}
+        self._throttle()
+        resp = self.session.post(
+            f"{WEBFLOW_BASE}/collections/{collection_id}/items",
+            json={"isArchived": False, "isDraft": False, "fieldData": field_data}
+        )
+        if not resp.ok:
+            log.error(f"  Fehler beim Erstellen: {resp.status_code} – {resp.text[:300]}")
+            return None
+        return resp.json()
+
+    def update_item(self, collection_id: str, item_id: str, field_data: dict, dry_run: bool = False) -> Optional[dict]:
+        """Aktualisiert ein bestehendes CMS-Item."""
+        if dry_run:
+            log.info(f"  [DRY-RUN] Würde aktualisieren: {field_data.get('name', '?')}")
+            return {"id": item_id}
+        self._throttle()
+        resp = self.session.patch(
+            f"{WEBFLOW_BASE}/collections/{collection_id}/items/{item_id}",
+            json={"isArchived": False, "isDraft": False, "fieldData": field_data}
+        )
+        if not resp.ok:
+            log.error(f"  Fehler beim Aktualisieren: {resp.status_code} – {resp.text[:300]}")
+            return None
+        return resp.json()
+
+    def publish_collection(self, collection_id: str, item_ids: list[str], dry_run: bool = False):
+        """Veröffentlicht Items einer Collection."""
+        if dry_run or not item_ids:
+            return
+        self._throttle()
+        resp = self.session.post(
+            f"{WEBFLOW_BASE}/collections/{collection_id}/items/publish",
+            json={"itemIds": item_ids}
+        )
+        if not resp.ok:
+            log.warning(f"  Veröffentlichung fehlgeschlagen: {resp.status_code} – {resp.text[:200]}")
 
 
-def parse_justimmo_item(root, justimmo_id):
-    data = {}
+# ─────────────────────────────────────────────
+# Daten-Mapping: Justimmo XML → Webflow Fields
+# ─────────────────────────────────────────────
+def map_realty_to_webflow(realty: ET.Element,
+                           type_map: dict,
+                           category_map: dict,
+                           location_map: dict,
+                           agent_map: dict) -> dict:
+    """
+    Konvertiert ein Justimmo XML-Immobilien-Element in ein Webflow fieldData-Dict.
+    Alle Feldnamen entsprechen den bestehenden Webflow Collection-Slugs.
+    """
+    objekt_id = xml_text(realty, "id")
+    titel     = xml_text(realty, "titel") or xml_text(realty, "objektnummer", f"Objekt {objekt_id}")
 
-    # Titel
-    titel_el = root.find('.//freitexte/objekttitel')
-    if titel_el is None or not titel_el.text:
-        titel_el = root.find('.//titel')
-    data['name'] = titel_el.text.strip() if titel_el is not None and titel_el.text else f"Immobilie {justimmo_id}"
+    # Preis
+    preis       = xml_text(realty, "preis")
+    gesamtmiete = xml_text(realty, "gesamtmiete")
+    kaufpreis   = xml_text(realty, "kaufpreis")
+    preis_str   = ""
+    if kaufpreis and float(kaufpreis or 0) > 0:
+        preis_str = f"€ {float(kaufpreis):,.0f}".replace(",", ".")
+    elif gesamtmiete and float(gesamtmiete or 0) > 0:
+        preis_str = f"€ {float(gesamtmiete):,.0f} / Monat"
+    elif preis and float(preis or 0) > 0:
+        preis_str = f"€ {float(preis):,.0f}"
+
+    # Fläche
+    wohnflaeche  = xml_float(realty, "wohnflaeche")
+    nutzflaeche  = xml_float(realty, "nutzflaeche")
+    grundflaeche = xml_float(realty, "grundflaeche")
+    flaeche_val  = wohnflaeche or nutzflaeche or grundflaeche
+    flaeche_str  = f"{flaeche_val:g} m²" if flaeche_val else ""
+
+    # Zimmer & Bäder
+    zimmer  = xml_text(realty, "anzahl_zimmer")
+    baeder  = xml_text(realty, "anzahl_badezimmer")
+    parking = xml_text(realty, "anzahl_stellplaetze") or xml_text(realty, "anzahl_garagen")
+
+    # Adresse / Standort
+    ort  = xml_text(realty, "ort")
+    plz  = xml_text(realty, "plz")
+    land = xml_text(realty, "land")
+    location_str = ", ".join(filter(None, [plz, ort, land]))
 
     # Beschreibung
-    beschr_el = root.find('.//objektbeschreibung')
-    if beschr_el is not None and beschr_el.text:
-        beschr = re.sub(r'<[^>]+>', ' ', beschr_el.text)
-        beschr = re.sub(r'\s+', ' ', beschr).strip()
-        data['property-overview'] = beschr[:5000]
-    else:
-        data['property-overview'] = ''
+    beschreibung = xml_text(realty, "objektbeschreibung") or xml_text(realty, "dreizeiler")
+    # HTML-Tags entfernen für PlainText
+    beschreibung_plain = re.sub(r"<[^>]+>", " ", beschreibung).strip()
+    beschreibung_plain = re.sub(r"\s+", " ", beschreibung_plain)
 
-    data['justimmo-id'] = str(justimmo_id)
-    objnr_el = root.find('.//verwaltung_techn/objektnr_extern')
-    data['objektnummer'] = objnr_el.text.strip() if objnr_el is not None and objnr_el.text else ''
+    # Bilder
+    bilder = []
+    for pic_node in realty.findall(".//anhang"):
+        url = pic_node.findtext("daten/pfad") or pic_node.findtext("pfad")
+        if url:
+            bilder.append(url)
+    # Fallback: erstes/zweites Bild aus Kurzliste
+    if not bilder:
+        for tag in ["erstes_bild", "zweites_bild", "drittes_bild"]:
+            url = xml_text(realty, tag)
+            if url:
+                bilder.append(url)
 
-    # Adresse (PLZ + Ort)
-    plz_el = root.find('.//geo/plz')
-    ort_el = root.find('.//geo/ort')
-    plz = plz_el.text.strip() if plz_el is not None and plz_el.text else ''
-    ort = ort_el.text.strip() if ort_el is not None and ort_el.text else ''
-    data['property-location'] = f"{plz} {ort}".strip()
+    cover_image = {"url": bilder[0]} if bilder else None
 
-    # Bundesland
-    bundesland = PLZ_BUNDESLAND.get(plz[:4] if plz else '', '')
-    if not bundesland:
-        if ort.lower() == 'wien':
-            bundesland = 'Wien'
-        elif plz.startswith('2') or plz.startswith('3'):
-            bundesland = 'Niederösterreich'
-        elif plz.startswith('7'):
-            bundesland = 'Burgenland'
-    data['_bundesland'] = bundesland
+    # Objektart / Typ
+    objektart_name = xml_text(realty, ".//user_defined_simplefield[@feldname='objektart_name']")
+    sub_art_name   = xml_text(realty, ".//user_defined_simplefield[@feldname='sub_objektart_name']")
+    vermarktung_kauf  = realty.find(".//vermarktungsart[@KAUF='1']") is not None
+    vermarktung_miete = realty.find(".//vermarktungsart[@MIETE_PACHT='1']") is not None
 
-    # Vermarktungsart
-    kauf_el = root.find('.//objektkategorie/vermarktungsart')
-    if kauf_el is not None:
-        if kauf_el.get('KAUF') == '1':
-            data['_kategorie'] = 'Kaufen'
-        elif kauf_el.get('MIETE_PACHT') == '1':
-            data['_kategorie'] = 'Mieten'
-        elif kauf_el.get('ANLAGE') == '1':
-            data['_kategorie'] = 'Anlage'
-        else:
-            data['_kategorie'] = 'Kaufen'
-    else:
-        data['_kategorie'] = 'Kaufen'
+    # Kategorie bestimmen (Kauf / Miete)
+    kategorie_name = "Kauf" if vermarktung_kauf else ("Miete" if vermarktung_miete else "")
 
-    # Objektart
-    objektart_name = get_field(root, 'objektart_name')
-    if 'Wohnung' in objektart_name:
-        data['_typ'] = 'Wohnung'
-    elif 'Haus' in objektart_name or 'Villa' in objektart_name:
-        data['_typ'] = 'Haus'
-    elif 'Grundstück' in objektart_name or 'Grund' in objektart_name:
-        data['_typ'] = 'Grundstück'
-    elif 'Gewerbe' in objektart_name or 'Büro' in objektart_name:
-        data['_typ'] = 'Gewerbe'
-    elif 'Garage' in objektart_name or 'Stellplatz' in objektart_name:
-        data['_typ'] = 'Garage'
-    elif 'Zinshaus' in objektart_name:
-        data['_typ'] = 'Zinshaus'
-    else:
-        data['_typ'] = 'Wohnung'
+    # Ausstattungsmerkmale als Feature-Felder
+    ausstattung = []
+    for feat in realty.findall(".//ausstattung/*"):
+        if feat.text and feat.text.strip() not in ("0", "false", ""):
+            ausstattung.append(feat.tag.replace("_", " ").title())
+    # Zusätzliche Merkmale aus user_defined_simplefield
+    for f in realty.findall(".//user_defined_simplefield"):
+        name = f.get("feldname", "")
+        if name.startswith("ausstattung_") and f.text and f.text not in ("0",):
+            ausstattung.append(f.text.strip())
 
-    # Preise
-    preise = root.find('.//preise')
-    if preise is not None:
-        def get_price(tag):
-            el = preise.find(tag)
-            return el.text.strip() if el is not None and el.text else ''
+    features = ausstattung[:5]  # Webflow hat 5 Feature-Felder
 
-        kaufpreis = get_price('kaufpreis')
-        gesamtmiete = get_price('gesamtmiete')
-        nettomiete = get_price('nettokaltmiete')
-        warmmiete = get_price('warmmiete')
+    # Makler / Agent
+    makler_id   = xml_text(realty, ".//kontaktperson/id") or xml_text(realty, "mitarbeiter_id")
+    agent_wf_id = agent_map.get(makler_id)
 
-        if kaufpreis:
-            try:
-                p = float(kaufpreis)
-                data['property-price'] = f"€ {p:,.0f}".replace(',', '.')
-            except:
-                data['property-price'] = f"€ {kaufpreis}"
-        elif gesamtmiete:
-            try:
-                p = float(gesamtmiete)
-                data['property-price'] = f"€ {p:,.2f} / Monat".replace(',', '.')
-            except:
-                data['property-price'] = f"€ {gesamtmiete} / Monat"
-        else:
-            data['property-price'] = ''
+    # Typ-Referenz
+    type_wf_id     = type_map.get(objektart_name) or type_map.get(sub_art_name)
+    category_wf_id = category_map.get(kategorie_name)
+    location_wf_id = location_map.get(ort)
 
-        data['kaufpreis'] = kaufpreis
-        data['kaufpreis-netto'] = get_price('kaufpreisnetto')
-        data['warmmiete'] = warmmiete
-        data['nettokaltmiete'] = nettomiete
-        data['gesamtmiete'] = gesamtmiete
-        data['nebenkosten'] = get_price('nebenkosten')
-        data['heizkosten'] = get_price('heizkosten')
-        prov_el = preise.find('aussen_courtage')
-        data['provision'] = prov_el.text.strip() if prov_el is not None and prov_el.text else ''
-    else:
-        data['property-price'] = ''
-        for k in ['kaufpreis', 'kaufpreis-netto', 'warmmiete', 'nettokaltmiete', 'gesamtmiete', 'nebenkosten', 'heizkosten', 'provision']:
-            data[k] = ''
+    # Slug generieren (eindeutig durch Objekt-ID)
+    slug = slugify(f"{titel}-{objekt_id}")
 
-    # Flächen
-    flaechen = root.find('.//flaechen')
-    if flaechen is not None:
-        def get_fl(tag):
-            el = flaechen.find(tag)
-            return el.text.strip() if el is not None and el.text else ''
-        wfl = get_fl('wohnflaeche')
-        nutzfl = get_fl('nutzflaeche')
-        grundfl = get_fl('grundstuecksflaeche')
-        data['wohnflache-m2'] = wfl
-        data['nutzflache-m2'] = nutzfl
-        data['grundstucksflache-m2'] = grundfl
-        hauptfl = wfl or nutzfl or grundfl
-        if hauptfl:
-            try:
-                data['property-area'] = f"{float(hauptfl):,.2f} m²".replace(',', '.')
-            except:
-                data['property-area'] = f"{hauptfl} m²"
-        else:
-            data['property-area'] = ''
-    else:
-        data['wohnflache-m2'] = data['nutzflache-m2'] = data['grundstucksflache-m2'] = data['property-area'] = ''
+    # Ausstattungs-Switches (Justimmo-spezifische Felder)
+    def has_feature(tag: str) -> bool:
+        node = realty.find(f".//{tag}")
+        return node is not None and node.text not in (None, "0", "false", "")
 
-    # Zimmer & Bad
-    zimmer_el = root.find('.//anzahl_zimmer')
-    data['property-beds'] = zimmer_el.text.strip() if zimmer_el is not None and zimmer_el.text else ''
-    bad_el = root.find('.//anzahl_badezimmer')
-    data['property-bathrooms'] = bad_el.text.strip() if bad_el is not None and bad_el.text else ''
-
-    # Stellplätze
-    for tag in ['stellplatz_anzahl', 'anzahl_stellplaetze']:
-        el = root.find(f'.//{tag}')
-        if el is not None and el.text:
-            data['property-parking'] = el.text.strip()
-            break
-    else:
-        data['property-parking'] = ''
-
-    # Weitere Felder
-    etage_el = root.find('.//etage')
-    data['etage'] = etage_el.text.strip() if etage_el is not None and etage_el.text else ''
-    data['baujahr'] = get_field(root, 'baujahr')
-    data['zustand'] = get_field(root, 'zustand_name') or ''
-    data['heizung'] = get_field(root, 'heizungsart_name')
-    hwb = get_field(root, 'hwb_wert')
-    hwb_kl = get_field(root, 'hwb_klasse')
-    data['energieausweis'] = (f"HWB: {hwb} kWh/m²a" + (f" ({hwb_kl})" if hwb_kl else '')) if hwb else ''
-    data['verfuegbar-ab'] = get_field(root, 'verfuegbar_ab')
-
-    # Ausstattung
-    ausstattung = root.find('.//ausstattung')
-    def has_feature(tag):
-        if ausstattung is None:
-            return False
-        el = ausstattung.find(f'.//{tag}')
-        return el is not None and el.text and el.text.strip() in ['1', 'true', 'True']
-
-    data['air-conditioner'] = has_feature('klimaanlage')
-    data['washing-machine'] = has_feature('waschmaschine')
-    data['wardrobe'] = has_feature('einbauschrank')
-    data['keller'] = has_feature('keller')
-    data['aufzug'] = has_feature('personenaufzug')
-    data['barrierefrei'] = has_feature('barrierefrei')
-
-    terrasse_el = root.find('.//anzahl_terrassen')
-    balkon_el = root.find('.//anzahl_balkone')
-    data['terrasse-balkon'] = (
-        (terrasse_el is not None and terrasse_el.text and int(terrasse_el.text.strip() or 0) > 0) or
-        (balkon_el is not None and balkon_el.text and int(balkon_el.text.strip() or 0) > 0)
-    )
-
-    # Koordinaten
-    lat = get_field(root, 'ungenaue_verortung_breitengrad') or get_field(root, 'geokoordinaten_breitengrad')
-    lon = get_field(root, 'ungenaue_verortung_laengengrad') or get_field(root, 'geokoordinaten_laengengrad')
-    data['latitude-4'] = lat
-    data['longitude-3'] = lon
-
-    # Agent aus Kontaktperson
-    kontakt = root.find('.//kontaktperson')
-    if kontakt is not None:
-        agent_justimmo_id = kontakt.findtext('id', '').strip()
-        data['_agent_justimmo_id'] = agent_justimmo_id
-    else:
-        data['_agent_justimmo_id'] = ''
-
-    return data
-
-
-# ============================================================
-# WEBFLOW API
-# ============================================================
-
-def get_all_webflow_items():
-    items = []
-    offset = 0
-    limit = 100
-    while True:
-        url = f"https://api.webflow.com/v2/collections/{COLLECTION_ID}/items?limit={limit}&offset={offset}"
-        resp = requests.get(url, headers=WEBFLOW_HEADERS)
-        data = resp.json()
-        batch = data.get('items', [])
-        items.extend(batch)
-        if len(batch) < limit:
-            break
-        offset += limit
-    return items
-
-
-def make_slug(name):
-    name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode('ascii')
-    name = re.sub(r'[^a-z0-9\s-]', '', name.lower())
-    return re.sub(r'[\s-]+', '-', name).strip('-')[:80]
-
-
-def build_webflow_payload(data):
-    bundesland_id = BUNDESLAND_IDS.get(data.get('_bundesland', ''), '')
-    kategorie_id = CATEGORY_IDS.get(data.get('_kategorie', 'Kaufen'), CATEGORY_IDS['Kaufen'])
-    typ_id = TYPE_IDS.get(data.get('_typ', 'Wohnung'), TYPE_IDS['Wohnung'])
-
-    payload = {
-        "justimmo-id": data.get('justimmo-id', ''),
-        "name": data.get('name', ''),
-        "property-location": data.get('property-location', ''),
-        "property-overview": data.get('property-overview', ''),
-        "property-price": data.get('property-price', ''),
-        "property-area": data.get('property-area', ''),
-        "property-beds": data.get('property-beds', ''),
-        "property-bathrooms": data.get('property-bathrooms', ''),
-        "property-parking": data.get('property-parking', ''),
-        "objektnummer": data.get('objektnummer', ''),
-        "etage": data.get('etage', ''),
-        "baujahr": data.get('baujahr', ''),
-        "zustand": data.get('zustand', ''),
-        "heizung": data.get('heizung', ''),
-        "energieausweis": data.get('energieausweis', ''),
-        "betriebskosten": data.get('nebenkosten', ''),
-        "provision": data.get('provision', ''),
-        "verfuegbar-ab": data.get('verfuegbar-ab', ''),
-        "kaufpreis": data.get('kaufpreis', ''),
-        "kaufpreis-netto": data.get('kaufpreis-netto', ''),
-        "warmmiete": data.get('warmmiete', ''),
-        "nettokaltmiete": data.get('nettokaltmiete', ''),
-        "gesamtmiete": data.get('gesamtmiete', ''),
-        "nebenkosten": data.get('nebenkosten', ''),
-        "heizkosten": data.get('heizkosten', ''),
-        "wohnflache-m2": data.get('wohnflache-m2', ''),
-        "nutzflache-m2": data.get('nutzflache-m2', ''),
-        "grundstucksflache-m2": data.get('grundstucksflache-m2', ''),
-        "latitude-4": data.get('latitude-4', ''),
-        "longitude-3": data.get('longitude-3', ''),
-        "air-conditioner": data.get('air-conditioner', False),
-        "washing-machine": data.get('washing-machine', False),
-        "wardrobe": data.get('wardrobe', False),
-        "keller": data.get('keller', False),
-        "aufzug": data.get('aufzug', False),
-        "barrierefrei": data.get('barrierefrei', False),
-        "terrasse-balkon": data.get('terrasse-balkon', False),
-        "agent-detail": JUSTIMMO_AGENT_MAPPING.get(data.get('_agent_justimmo_id', ''), DEFAULT_AGENT_ID),
-        "property-locations": bundesland_id,
-        "property-categories": kategorie_id,
-        "property-type": typ_id,
-    }
-    return payload
-
-
-def create_webflow_item(data):
-    url = f"https://api.webflow.com/v2/collections/{COLLECTION_ID}/items"
-    payload_data = build_webflow_payload(data)
-    payload_data['slug'] = make_slug(data.get('name', ''))
-    resp = requests.post(url, headers=WEBFLOW_HEADERS, json={"fieldData": payload_data, "isDraft": False})
-    return resp.status_code, resp.json()
-
-
-def update_webflow_item(item_id, data):
-    url = f"https://api.webflow.com/v2/collections/{COLLECTION_ID}/items/{item_id}"
-    resp = requests.patch(url, headers=WEBFLOW_HEADERS, json={"fieldData": build_webflow_payload(data)})
-    return resp.status_code, resp.json()
-
-
-def archive_webflow_item(item_id):
-    url = f"https://api.webflow.com/v2/collections/{COLLECTION_ID}/items/{item_id}"
-    resp = requests.patch(url, headers=WEBFLOW_HEADERS, json={"isArchived": True})
-    return resp.status_code
-
-
-def publish_all_items(item_ids):
-    url = f"https://api.webflow.com/v2/collections/{COLLECTION_ID}/items/publish"
-    for i in range(0, len(item_ids), 100):
-        batch = item_ids[i:i+100]
-        resp = requests.post(url, headers=WEBFLOW_HEADERS, json={"itemIds": batch})
-        log.info(f"  Publish Batch {i//100+1}: Status {resp.status_code}")
-        time.sleep(1)
-
-
-def publish_site():
-    url = f"https://api.webflow.com/v2/sites/{SITE_ID}/publish"
-    resp = requests.post(url, headers=WEBFLOW_HEADERS, json={"publishToWebflowSubdomain": True})
-    log.info(f"Site-Publish: {resp.status_code}")
-
-
-AGENTS_COLLECTION_ID = "699f29e03ecf1945550ca38b"
-
-# Webflow-Agenten-ID → Justimmo-Agenten-ID (umgekehrtes Mapping)
-WEBFLOW_TO_JUSTIMMO_AGENT = {v: k for k, v in JUSTIMMO_AGENT_MAPPING.items()}
-
-
-def update_agent_listings(all_webflow_items):
-    """Agenten-Objekte-Feld (agent-listings) mit den richtigen Immobilien befüllen."""
-    log.info("\n[6/6] Aktualisiere Agenten-Objekte-Zuordnung...")
-
-    # Immobilien nach Agenten gruppieren
-    agent_to_items = {agent_id: [] for agent_id in JUSTIMMO_AGENT_MAPPING.values()}
-
-    for item in all_webflow_items:
-        fd = item.get('fieldData', {})
-        agent_id = fd.get('agent-detail', '')
-        if agent_id in agent_to_items:
-            agent_to_items[agent_id].append(item['id'])
-
-    # Jeden Agenten aktualisieren
-    for webflow_agent_id, property_ids in agent_to_items.items():
-        agent_name = next(
-            (item.get('fieldData', {}).get('name', '') 
-             for item in [] if item.get('id') == webflow_agent_id),
-            webflow_agent_id
-        )
-        log.info(f"  Agent {webflow_agent_id}: {len(property_ids)} Objekte")
-
-        url = f"https://api.webflow.com/v2/collections/{AGENTS_COLLECTION_ID}/items/{webflow_agent_id}"
-        resp = requests.patch(
-            url,
-            headers=WEBFLOW_HEADERS,
-            json={"fieldData": {"agent-listings": property_ids}}
-        )
-        if resp.status_code == 200:
-            log.info(f"    ✓ {len(property_ids)} Objekte gesetzt")
-        else:
-            log.error(f"    ✗ Fehler {resp.status_code}: {resp.json().get('message', '')}")
-        time.sleep(0.3)
-
-    # Agenten publizieren
-    agent_ids = list(JUSTIMMO_AGENT_MAPPING.values())
-    pub_url = f"https://api.webflow.com/v2/collections/{AGENTS_COLLECTION_ID}/items/publish"
-    resp = requests.post(pub_url, headers=WEBFLOW_HEADERS, json={"itemIds": agent_ids})
-    log.info(f"  Agenten publiziert: {resp.status_code}")
-
-
-# ============================================================
-# HAUPTPROGRAMM
-# ============================================================
-
-def main():
-    log.info("=" * 60)
-    log.info(f"Justimmo → Webflow Sync gestartet: {datetime.now()}")
-    log.info("=" * 60)
-
-    log.info("\n[1/5] Lade alle aktiven Justimmo-IDs...")
-    justimmo_ids = get_justimmo_all_ids()
-    log.info(f"  {len(justimmo_ids)} aktive Immobilien bei Justimmo")
-
-    log.info("\n[2/5] Lade alle Webflow CMS Items...")
-    webflow_items = get_all_webflow_items()
-    log.info(f"  {len(webflow_items)} Items in Webflow")
-
-    webflow_by_justimmo_id = {
-        str(item.get('fieldData', {}).get('justimmo-id', '')): item
-        for item in webflow_items
-        if item.get('fieldData', {}).get('justimmo-id', '')
+    field_data = {
+        "name":                 titel,
+        "slug":                 slug,
+        "property-location":    location_str,
+        "property-overview":    beschreibung_plain[:5000],
+        "property-price":       preis_str,
+        "property-area":        flaeche_str,
+        "property-beds":        zimmer,
+        "property-bathrooms":   baeder,
+        "property-parking":     parking,
+        "feature-property":     False,  # Standard: kein Featured
     }
 
-    justimmo_id_set = set(str(i) for i in justimmo_ids)
-    webflow_id_set = set(webflow_by_justimmo_id.keys())
+    # Bilder hinzufügen
+    if cover_image:
+        field_data["property-cover-image"] = cover_image
+    for i, img_url in enumerate(bilder[1:5], 1):
+        field_data[f"small-image-{i}"] = {"url": img_url}
 
-    new_ids = justimmo_id_set - webflow_id_set
-    update_ids = justimmo_id_set & webflow_id_set
-    remove_ids = webflow_id_set - justimmo_id_set
+    # Feature-Texte
+    for i, feat in enumerate(features, 1):
+        field_data[f"feature-{i}"] = feat
 
-    log.info(f"\n  Neu anlegen:   {len(new_ids)}")
-    log.info(f"  Aktualisieren: {len(update_ids)}")
-    log.info(f"  Archivieren:   {len(remove_ids)}")
+    # Referenz-Felder (nur setzen wenn ID vorhanden)
+    if type_wf_id:
+        field_data["property-type"] = type_wf_id
+    if category_wf_id:
+        field_data["property-categories"] = category_wf_id
+    if location_wf_id:
+        field_data["property-locations"] = location_wf_id
+    if agent_wf_id:
+        field_data["agent-detail"] = agent_wf_id
 
-    stats = {'created': 0, 'updated': 0, 'archived': 0, 'errors': 0}
-    published_ids = []
+    # Neue Justimmo-spezifische Felder
+    etage    = xml_text(realty, "etage")
+    baujahr  = xml_text(realty, "baujahr")
+    zustand  = xml_text(realty, ".//user_defined_simplefield[@feldname='zustand_name']")
+    heizung  = xml_text(realty, ".//user_defined_simplefield[@feldname='heizungsart_name']")
+    hwb      = xml_text(realty, "hwb") or xml_text(realty, "energieausweis")
+    bk       = xml_text(realty, "betriebskosten")
+    provision= xml_text(realty, "provision")
+    verfuegbar = xml_text(realty, "verfuegbar_ab") or xml_text(realty, "bezugsfrei_ab")
 
-    log.info(f"\n[3/5] Lege {len(new_ids)} neue Immobilien an...")
-    for i, jid in enumerate(sorted(new_ids)):
-        log.info(f"  [{i+1}/{len(new_ids)}] Neu: {jid}")
-        root = get_justimmo_detail(jid)
-        if root is None:
-            stats['errors'] += 1
-            continue
-        data = parse_justimmo_item(root, jid)
-        log.info(f"    {data['name'][:60]}")
-        status, result = create_webflow_item(data)
-        if status in [200, 201]:
-            published_ids.append(result.get('id', ''))
-            stats['created'] += 1
-            log.info(f"    ✓ Erstellt")
-        else:
-            log.error(f"    ✗ Fehler {status}: {result.get('message', '')}")
-            stats['errors'] += 1
-        time.sleep(0.5)
+    if etage:     field_data["etage"]          = etage
+    if baujahr:   field_data["baujahr"]        = baujahr
+    if zustand:   field_data["zustand"]        = zustand
+    if heizung:   field_data["heizung"]        = heizung
+    if hwb:       field_data["energieausweis"] = hwb
+    if bk:        field_data["betriebskosten"] = f"€ {float(bk):,.2f}" if bk.replace('.','').isdigit() else bk
+    if provision: field_data["provision"]      = provision
+    if verfuegbar:field_data["verfuegbar-ab"]  = verfuegbar
 
-    log.info(f"\n[4/5] Aktualisiere {len(update_ids)} bestehende Immobilien...")
-    for i, jid in enumerate(sorted(update_ids)):
-        item_id = webflow_by_justimmo_id[jid]['id']
-        log.info(f"  [{i+1}/{len(update_ids)}] Update: {jid}")
-        root = get_justimmo_detail(jid)
-        if root is None:
-            stats['errors'] += 1
-            continue
-        data = parse_justimmo_item(root, jid)
-        status, result = update_webflow_item(item_id, data)
-        if status == 200:
-            published_ids.append(item_id)
-            stats['updated'] += 1
-            log.info(f"    ✓ Aktualisiert")
-        else:
-            log.error(f"    ✗ Fehler {status}: {result.get('message', '')}")
-            stats['errors'] += 1
-        time.sleep(0.3)
+    # Justimmo-ID speichern
+    field_data["justimmo-id"]   = objekt_id
+    field_data["objektnummer"]  = xml_text(realty, "objektnummer")
 
-    log.info(f"\n[5/5] Archiviere {len(remove_ids)} nicht mehr aktive Immobilien...")
-    for jid in sorted(remove_ids):
-        item_id = webflow_by_justimmo_id[jid]['id']
-        name = webflow_by_justimmo_id[jid].get('fieldData', {}).get('name', '')[:50]
-        log.info(f"  Archiviere: {name}")
-        status = archive_webflow_item(item_id)
-        if status == 200:
-            stats['archived'] += 1
-            log.info(f"    ✓ Archiviert")
-        else:
-            log.error(f"    ✗ Fehler {status}")
-            stats['errors'] += 1
-        time.sleep(0.3)
+    # Ausstattungs-Switches (Mapping Justimmo → Webflow)
+    switch_map = {
+        "tv":              ["tv", "fernseher"],
+        "air-conditioner": ["klimaanlage", "klima"],
+        "washing-machine": ["waschmaschine"],
+        "internet":        ["internet", "wlan", "wifi"],
+        "water-heater":    ["warmwasser", "boiler"],
+        "refrigerator":    ["kuehlschrank", "kühlschrank"],
+        "sofa":            ["sofa", "couch"],
+        "wardrobe":        ["schrank", "kleiderschrank"],
+        "gas":             ["gas", "gasheizung"],
+        "kitchen":         ["kueche", "küche", "einbaukueche", "einbauküche"],
+    }
+    for wf_slug, keywords in switch_map.items():
+        for kw in keywords:
+            if has_feature(kw):
+                field_data[wf_slug] = True
+                break
 
-    log.info(f"\nPubliziere {len(published_ids)} Items...")
-    if published_ids:
-        publish_all_items(published_ids)
+    # Terrasse/Balkon, Keller, Aufzug
+    terrassen = xml_float(realty, "anzahl_terrassen") + xml_float(realty, "anzahl_balkons") + xml_float(realty, "anzahl_loggias")
+    if terrassen > 0:
+        field_data["terrasse-balkon"] = True
+    if xml_float(realty, "anzahl_keller") > 0:
+        field_data["keller"] = True
+    if xml_text(realty, "aufzug") not in ("", "0", "false"):
+        field_data["aufzug"] = True
+    if xml_text(realty, "barrierefrei") not in ("", "0", "false"):
+        field_data["barrierefrei"] = True
 
-    # Agenten-Objekte aktualisieren (alle aktuellen Webflow-Items neu laden)
-    all_current_items = get_all_webflow_items()
-    update_agent_listings(all_current_items)
+    # Justimmo-ID als Referenz in Feature-1 speichern falls leer
+    if not field_data.get("feature-1"):
+        field_data["feature-1"] = f"Justimmo-ID: {objekt_id}"
 
-    log.info("\nPubliziere Site...")
-    publish_site()
+    return field_data
 
+
+def map_agent_to_webflow(kontakt: ET.Element) -> dict:
+    """Konvertiert einen Justimmo-Kontakt/Makler in Webflow Agent-Felder."""
+    vorname  = xml_text(kontakt, "vorname")
+    nachname = xml_text(kontakt, "nachname")
+    name     = f"{vorname} {nachname}".strip() or xml_text(kontakt, "name", "Unbekannt")
+    tel      = xml_text(kontakt, "tel") or xml_text(kontakt, "mobile")
+    email    = xml_text(kontakt, "email")
+    titel    = xml_text(kontakt, "titel")
+    firma    = xml_text(kontakt, "firma")
+
+    return {
+        "name":            name,
+        "slug":            slugify(name),
+        "agent-title":     titel or firma or "Makler",
+        "agent-phone":     tel,
+        "agent-email":     email,
+        "about-agent":     xml_text(kontakt, "beschreibung"),
+        "address-office":  xml_text(kontakt, "strasse"),
+    }
+
+
+# ─────────────────────────────────────────────
+# Lookup-Maps: Name → Webflow Item ID
+# ─────────────────────────────────────────────
+def build_lookup_map(wf: WebflowClient, collection_id: str, key_field: str = "name") -> dict:
+    """Erstellt ein Dict {feldwert: webflow_item_id} für schnelle Suche."""
+    items = wf.get_collection_items(collection_id)
+    result = {}
+    for item in items:
+        fd = item.get("fieldData", {})
+        key = fd.get(key_field, "")
+        if key:
+            result[key] = item["id"]
+    return result
+
+
+def build_slug_map(wf: WebflowClient, collection_id: str) -> tuple[dict, dict]:
+    """Erstellt ein Dict {slug: webflow_item_id} und {item_id: feature-property-wert}."""
+    items = wf.get_collection_items(collection_id)
+    slug_map = {item.get("fieldData", {}).get("slug", ""): item["id"] for item in items}
+    featured_map = {item["id"]: item.get("fieldData", {}).get("feature-property", False) for item in items}
+    return slug_map, featured_map
+
+
+def ensure_reference_item(wf: WebflowClient, collection_id: str,
+                           name: str, lookup: dict, dry_run: bool) -> Optional[str]:
+    """Stellt sicher, dass ein Referenz-Item existiert, erstellt es ggf. neu."""
+    if not name:
+        return None
+    if name in lookup:
+        return lookup[name]
+    result = wf.create_item(collection_id, {"name": name, "slug": slugify(name)}, dry_run)
+    if result and result.get("id") and result["id"] != "dry-run":
+        lookup[name] = result["id"]
+        return result["id"]
+    return None
+
+
+# ─────────────────────────────────────────────
+# Hauptsynchronisation
+# ─────────────────────────────────────────────
+def sync(dry_run: bool = False, max_items: int = None):
+    log.info("=" * 60)
+    log.info("Justimmo → Webflow Synchronisation gestartet")
+    log.info(f"Modus: {'DRY-RUN (keine Änderungen)' if dry_run else 'LIVE'}")
+    log.info("=" * 60)
+
+    # Clients initialisieren
+    jm = JustimmoClient(JUSTIMMO_USER, JUSTIMMO_PASS)
+    wf = WebflowClient(WEBFLOW_TOKEN)
+
+    # ── Schritt 1: Bestehende Webflow-Items laden ──────────────
+    log.info("\n[1/5] Lade bestehende Webflow-Collections...")
+    type_map     = build_lookup_map(wf, COL_TYPES)
+    category_map = build_lookup_map(wf, COL_CATEGORIES)
+    location_map = build_lookup_map(wf, COL_LOCATIONS)
+    agent_map    = build_lookup_map(wf, COL_AGENTS)
+    prop_slugs, featured_map = build_slug_map(wf, COL_PROPERTIES)
+
+    log.info(f"  Typen: {len(type_map)}, Kategorien: {len(category_map)}, "
+             f"Standorte: {len(location_map)}, Makler: {len(agent_map)}, "
+             f"Immobilien: {len(prop_slugs)}")
+
+    # ── Schritt 2: Immobilien von Justimmo abrufen ─────────────
+    log.info("\n[2/5] Rufe Immobilien von Justimmo ab...")
+    realties = jm.get_all_realties(max_items=max_items)
+
+    if not realties:
+        log.warning("Keine Immobilien von Justimmo erhalten. Prüfe Zugangsdaten!")
+        return
+
+    # ── Schritt 3: Referenz-Collections befüllen ───────────────
+    log.info("\n[3/5] Synchronisiere Referenz-Collections (Typen, Kategorien, Standorte)...")
+    created_ids = {COL_TYPES: [], COL_CATEGORIES: [], COL_LOCATIONS: [], COL_PROPERTIES: []}
+
+    for realty in realties:
+        objektart = xml_text(realty, ".//user_defined_simplefield[@feldname='objektart_name']")
+        ort       = xml_text(realty, "ort")
+        kauf      = realty.find(".//vermarktungsart[@KAUF='1']") is not None
+        miete     = realty.find(".//vermarktungsart[@MIETE_PACHT='1']") is not None
+        kategorie = "Kauf" if kauf else ("Miete" if miete else "")
+
+        if objektart:
+            wf_id = ensure_reference_item(wf, COL_TYPES, objektart, type_map, dry_run)
+            if wf_id and wf_id not in created_ids[COL_TYPES]:
+                created_ids[COL_TYPES].append(wf_id)
+
+        if kategorie:
+            wf_id = ensure_reference_item(wf, COL_CATEGORIES, kategorie, category_map, dry_run)
+            if wf_id and wf_id not in created_ids[COL_CATEGORIES]:
+                created_ids[COL_CATEGORIES].append(wf_id)
+
+        if ort:
+            wf_id = ensure_reference_item(wf, COL_LOCATIONS, ort, location_map, dry_run)
+            if wf_id and wf_id not in created_ids[COL_LOCATIONS]:
+                created_ids[COL_LOCATIONS].append(wf_id)
+
+    log.info(f"  Neue Typen: {len(created_ids[COL_TYPES])}, "
+             f"Kategorien: {len(created_ids[COL_CATEGORIES])}, "
+             f"Standorte: {len(created_ids[COL_LOCATIONS])}")
+
+    # ── Schritt 4: Immobilien synchronisieren ──────────────────
+    log.info("\n[4/5] Synchronisiere Immobilien...")
+    stats = {"neu": 0, "aktualisiert": 0, "fehler": 0}
+
+    for i, realty in enumerate(realties, 1):
+        objekt_id = xml_text(realty, "id")
+        titel     = xml_text(realty, "titel") or f"Objekt {objekt_id}"
+        slug      = slugify(f"{titel}-{objekt_id}")
+
+        log.info(f"  [{i}/{len(realties)}] {titel} (ID: {objekt_id})")
+
+        try:
+            field_data = map_realty_to_webflow(
+                realty, type_map, category_map, location_map, agent_map
+            )
+
+            if slug in prop_slugs:
+                # Aktualisieren — feature-property ("Empfohlenes Objekt") beibehalten
+                item_id = prop_slugs[slug]
+                field_data["feature-property"] = featured_map.get(item_id, False)
+                result = wf.update_item(COL_PROPERTIES, item_id, field_data, dry_run)
+                if result:
+                    stats["aktualisiert"] += 1
+                    created_ids[COL_PROPERTIES].append(item_id)
+                else:
+                    stats["fehler"] += 1
+            else:
+                # Neu erstellen
+                result = wf.create_item(COL_PROPERTIES, field_data, dry_run)
+                if result and result.get("id"):
+                    stats["neu"] += 1
+                    prop_slugs[slug] = result["id"]
+                    created_ids[COL_PROPERTIES].append(result["id"])
+                else:
+                    stats["fehler"] += 1
+
+        except Exception as e:
+            log.error(f"  Fehler bei Objekt {objekt_id}: {e}")
+            stats["fehler"] += 1
+
+    # ── Schritt 5: Veröffentlichen ─────────────────────────────
+    log.info("\n[5/5] Veröffentliche geänderte Items...")
+    for col_id, ids in created_ids.items():
+        if ids:
+            # Max. 100 IDs pro Publish-Request
+            for chunk in [ids[j:j+100] for j in range(0, len(ids), 100)]:
+                wf.publish_collection(col_id, chunk, dry_run)
+            log.info(f"  Collection {col_id}: {len(ids)} Items veröffentlicht")
+
+    # ── Zusammenfassung ────────────────────────────────────────
     log.info("\n" + "=" * 60)
-    log.info("SYNC ABGESCHLOSSEN")
-    log.info(f"  Neu angelegt:  {stats['created']}")
-    log.info(f"  Aktualisiert:  {stats['updated']}")
-    log.info(f"  Archiviert:    {stats['archived']}")
-    log.info(f"  Fehler:        {stats['errors']}")
-    log.info(f"  Abgeschlossen: {datetime.now()}")
+    log.info("Synchronisation abgeschlossen!")
+    log.info(f"  Neu erstellt:    {stats['neu']}")
+    log.info(f"  Aktualisiert:    {stats['aktualisiert']}")
+    log.info(f"  Fehler:          {stats['fehler']}")
     log.info("=" * 60)
 
 
+# ─────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Justimmo → Webflow Synchronisation")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Nur simulieren, keine Änderungen vornehmen")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Maximale Anzahl zu synchronisierender Immobilien")
+    args = parser.parse_args()
+
+    sync(dry_run=args.dry_run, max_items=args.limit)
