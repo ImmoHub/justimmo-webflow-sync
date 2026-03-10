@@ -314,20 +314,40 @@ def map_realty_to_webflow(realty: ET.Element,
     beschreibung_plain = re.sub(r"<[^>]+>", " ", beschreibung).strip()
     beschreibung_plain = re.sub(r"\s+", " ", beschreibung_plain)
 
-    # Bilder
-    bilder = []
+    # Bilder: TITELBILD-Gruppe als Cover, BILD-Gruppe[1:] als Galerie
+    # WICHTIG: BILD[0] ist immer das Agenten-Foto (PNG) – wird NICHT verwendet!
+    titelbild_urls = []
+    bild_urls = []
     for pic_node in realty.findall(".//anhang"):
-        url = pic_node.findtext("daten/pfad") or pic_node.findtext("pfad")
-        if url:
-            bilder.append(url)
-    # Fallback: erstes/zweites Bild aus Kurzliste
-    if not bilder:
+        gruppe = (pic_node.get("gruppe") or "BILD").upper()
+        if gruppe not in ("TITELBILD", "BILD"):
+            continue
+        # fullhd bevorzugen (1920x1080), dann big, dann pfad
+        url = (pic_node.findtext("daten/fullhd")
+               or pic_node.findtext("daten/big")
+               or pic_node.findtext("daten/pfad")
+               or pic_node.findtext("pfad"))
+        if not url or not url.strip():
+            continue
+        url = url.strip()
+        if gruppe == "TITELBILD":
+            titelbild_urls.append(url)
+        else:
+            bild_urls.append(url)
+
+    # Cover = TITELBILD (1 pro Immobilie, echtes Titelbild)
+    # Galerie = BILD[1:] (BILD[0] ist Agenten-PNG – überspringen)
+    cover_url = titelbild_urls[0] if titelbild_urls else None
+    galerie_urls = bild_urls[1:] if len(bild_urls) > 1 else bild_urls
+
+    # Fallback: Kurzliste wenn gar nichts vorhanden
+    if not cover_url and not galerie_urls:
         for tag in ["erstes_bild", "zweites_bild", "drittes_bild"]:
             url = xml_text(realty, tag)
             if url:
-                bilder.append(url)
+                galerie_urls.append(url)
 
-    cover_image = {"url": bilder[0]} if bilder else None
+    cover_image = {"url": cover_url} if cover_url else None
 
     # Objektart / Typ
     objektart_name = xml_text(realty, ".//user_defined_simplefield[@feldname='objektart_name']")
@@ -352,8 +372,13 @@ def map_realty_to_webflow(realty: ET.Element,
     features = ausstattung[:5]  # Webflow hat 5 Feature-Felder
 
     # Makler / Agent
-    makler_id   = xml_text(realty, ".//kontaktperson/id") or xml_text(realty, "mitarbeiter_id")
-    agent_wf_id = agent_map.get(makler_id)
+    # Die List-API liefert kontaktperson/id nicht zuverlässig.
+    # Wir prüfen mehrere mögliche Pfade.
+    makler_id = (xml_text(realty, ".//kontaktperson/id")
+                 or xml_text(realty, "kontaktperson_id")
+                 or xml_text(realty, "mitarbeiter_id")
+                 or xml_text(realty, ".//user_defined_simplefield[@feldname='kontaktperson_id']"))
+    agent_wf_id = agent_map.get(makler_id) if makler_id else None
 
     # Typ-Referenz
     type_wf_id     = type_map.get(objektart_name) or type_map.get(sub_art_name)
@@ -370,9 +395,9 @@ def map_realty_to_webflow(realty: ET.Element,
 
     field_data = {
         "name":                 titel,
-        "slug":                 slug,
+        # Slug wird NICHT beim Update gesetzt (Webflow-Validierungsfehler)
+        # Wird separat beim Create hinzugefügt (siehe sync()-Funktion)
         "property-location":    location_str,
-        "property-overview":    beschreibung_plain[:5000],
         "property-price":       preis_str,
         "property-area":        flaeche_str,
         "property-beds":        zimmer,
@@ -381,10 +406,14 @@ def map_realty_to_webflow(realty: ET.Element,
         "feature-property":     False,  # Standard: kein Featured
     }
 
+    # property-overview nur setzen wenn Inhalt vorhanden (Pflichtfeld!)
+    if beschreibung_plain:
+        field_data["property-overview"] = beschreibung_plain[:5000]
+
     # Bilder hinzufügen
     if cover_image:
         field_data["property-cover-image"] = cover_image
-    for i, img_url in enumerate(bilder[1:5], 1):
+    for i, img_url in enumerate(galerie_urls[:4], 1):
         field_data[f"small-image-{i}"] = {"url": img_url}
 
     # Feature-Texte
@@ -600,8 +629,11 @@ def sync(dry_run: bool = False, max_items: int = None):
 
             if slug in prop_slugs:
                 # Aktualisieren — feature-property ("Empfohlenes Objekt") beibehalten
+                # WICHTIG: Slug NICHT beim Update senden (Webflow-Validierungsfehler!)
                 item_id = prop_slugs[slug]
                 field_data["feature-property"] = featured_map.get(item_id, False)
+                # Sicherstellen dass kein Slug im Update-Dict ist
+                field_data.pop("slug", None)
                 result = wf.update_item(COL_PROPERTIES, item_id, field_data, dry_run)
                 if result:
                     stats["aktualisiert"] += 1
@@ -609,7 +641,8 @@ def sync(dry_run: bool = False, max_items: int = None):
                 else:
                     stats["fehler"] += 1
             else:
-                # Neu erstellen
+                # Neu erstellen – Slug nur beim Create setzen
+                field_data["slug"] = slug
                 result = wf.create_item(COL_PROPERTIES, field_data, dry_run)
                 if result and result.get("id"):
                     stats["neu"] += 1
