@@ -449,16 +449,21 @@ def map_realty_to_webflow(realty: ET.Element,
     objektart_name = xml_text(realty, "objektkategorie/user_defined_simplefield[@feldname='objektart_name']")
     vermarktung_kauf  = realty.find("objektkategorie/vermarktungsart[@KAUF='1']") is not None
     vermarktung_miete = realty.find("objektkategorie/vermarktungsart[@MIETE_PACHT='1']") is not None
-    kategorie_name = "Kauf" if vermarktung_kauf else ("Miete" if vermarktung_miete else "")
+    # WICHTIG: Bestehende Webflow-Kategorien heißen 'Kaufen', 'Mieten', 'Anlage' (nicht 'Kauf'/'Miete')
+    kategorie_name = "Kaufen" if vermarktung_kauf else ("Mieten" if vermarktung_miete else "")
 
     # ── Agent ─────────────────────────────────────────────────────
     agent_id    = xml_text(realty, "kontaktperson/id")
     agent_wf_id = AGENT_MAP.get(agent_id)
 
+    # ── Bundesland für Standort-Filter ───────────────────────────
+    bundesland = xml_text(realty, "geo/bundesland") or ""
+
     # ── Referenz-IDs ─────────────────────────────────────────────
     type_wf_id     = type_map.get(objektart_name)
     category_wf_id = category_map.get(kategorie_name)
-    location_wf_id = location_map.get(ort)
+    # Standort = Bundesland (nicht Ort), damit der Filter auf der Website korrekt funktioniert
+    location_wf_id = location_map.get(bundesland)
 
     # ── Bilder: Extrahieren und als Webflow Assets hochladen ──────
     cover_url, galerie_urls = extract_images(realty)
