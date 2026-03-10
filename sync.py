@@ -188,8 +188,11 @@ def upload_image_to_webflow(img_url: str, filename: str, wf_headers: dict) -> Op
             log.warning(f"    S3 Upload Fehler {s3_resp.status_code}")
             return None
 
-        log.info(f"    ✓ Bild hochgeladen: {filename} ({len(img_data)//1024}KB) → fileId={asset_id[:12]}...")
-        return {"fileId": asset_id, "url": hosted_url}
+        # CDN-URL konstruieren (Webflow CDN-Muster: cdn.prod.website-files.com/{siteId}/{assetId}_{filename})
+        cdn_url = f"https://cdn.prod.website-files.com/{WEBFLOW_SITE_ID}/{asset_id}_{filename}"
+        
+        log.info(f"    ✓ Bild hochgeladen: {filename} ({len(img_data)//1024}KB) → {asset_id[:12]}...")
+        return {"url": cdn_url}
 
     except Exception as e:
         log.warning(f"    Upload-Fehler für {img_url[-50:]}: {e}")
