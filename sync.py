@@ -593,29 +593,36 @@ def sync(dry_run: bool = False, max_items: int = None):
                 stats["fehler"] += 1
                 continue
 
-            titel    = xml_text(realty, "freitexte/objekttitel") or f"Objekt {objekt_id}"
-            objektnr = xml_text(realty, "verwaltung_techn/objektnr_extern")
-            ort      = xml_text(realty, "geo/ort")
-            objektart= xml_text(realty, "objektkategorie/user_defined_simplefield[@feldname='objektart_name']")
-            kauf     = realty.find("objektkategorie/vermarktungsart[@KAUF='1']") is not None
-            miete    = realty.find("objektkategorie/vermarktungsart[@MIETE_PACHT='1']") is not None
-            kategorie= "Kauf" if kauf else ("Miete" if miete else "")
+            titel      = xml_text(realty, "freitexte/objekttitel") or f"Objekt {objekt_id}"
+            objektnr   = xml_text(realty, "verwaltung_techn/objektnr_extern")
+            ort        = xml_text(realty, "geo/ort")
+            bundesland = xml_text(realty, "geo/bundesland") or ""
+            objektart  = xml_text(realty, "objektkategorie/user_defined_simplefield[@feldname='objektart_name']")
+            kauf       = realty.find("objektkategorie/vermarktungsart[@KAUF='1']") is not None
+            miete      = realty.find("objektkategorie/vermarktungsart[@MIETE_PACHT='1']") is not None
+            # WICHTIG: Bestehende Webflow-Kategorien heißen 'Kaufen', 'Mieten', 'Anlage'
+            kategorie  = "Kaufen" if kauf else ("Mieten" if miete else "")
 
-            log.info(f"  [{i}/{len(all_ids)}] {titel} (Nr: {objektnr}, Ort: {ort})")
+            log.info(f"  [{i}/{len(all_ids)}] {titel} (Nr: {objektnr}, Ort: {ort}, Bundesland: {bundesland})")
 
             # Referenz-Items sicherstellen
+            # Typen: neue Typen werden angelegt falls noch nicht vorhanden
             if objektart:
                 wf_id = ensure_reference_item(wf, COL_TYPES, objektart, type_map, dry_run)
                 if wf_id and wf_id not in created_ids[COL_TYPES]:
                     created_ids[COL_TYPES].append(wf_id)
-            if kategorie:
-                wf_id = ensure_reference_item(wf, COL_CATEGORIES, kategorie, category_map, dry_run)
-                if wf_id and wf_id not in created_ids[COL_CATEGORIES]:
-                    created_ids[COL_CATEGORIES].append(wf_id)
-            if ort:
-                wf_id = ensure_reference_item(wf, COL_LOCATIONS, ort, location_map, dry_run)
-                if wf_id and wf_id not in created_ids[COL_LOCATIONS]:
-                    created_ids[COL_LOCATIONS].append(wf_id)
+            # Kategorien: NUR bestehende verwenden, KEINE neuen anlegen!
+            if kategorie and kategorie in category_map:
+                if category_map[kategorie] not in created_ids[COL_CATEGORIES]:
+                    created_ids[COL_CATEGORIES].append(category_map[kategorie])
+            elif kategorie:
+                log.warning(f"  Kategorie '{kategorie}' nicht in Webflow gefunden – übersprungen")
+            # Standorte: Bundesland verwenden, NUR bestehende (Wien/NÖ/Bgld), KEINE neuen anlegen!
+            if bundesland and bundesland in location_map:
+                if location_map[bundesland] not in created_ids[COL_LOCATIONS]:
+                    created_ids[COL_LOCATIONS].append(location_map[bundesland])
+            elif bundesland:
+                log.warning(f"  Bundesland '{bundesland}' nicht in Webflow gefunden – übersprungen")
 
             # Field-Data aufbauen (inkl. Bild-Upload)
             field_data = map_realty_to_webflow(
