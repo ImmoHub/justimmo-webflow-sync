@@ -4,26 +4,17 @@
   var STORAGE_KEY = 'ir_filter_v15';
   var path = window.location.pathname;
 
-  // ── Slug → Bundesland-Name Mapping (URL-Slug zu filter-data.js Wert) ──
+  // ── Slug → Bundesland-Name Mapping (nur Wien und Niederösterreich) ──
   var slugToBundesland = {
-    'wien':               'Wien',
-    'niederoesterreich':  'Niederösterreich',
-    'burgenland':         'Burgenland',
-    'oberoesterreich':    'Oberösterreich',
-    'steiermark':         'Steiermark',
-    'kaernten':           'Kärnten',
-    'salzburg':           'Salzburg',
-    'tirol':              'Tirol',
-    'vorarlberg':         'Vorarlberg'
+    'wien':              'Wien',
+    'niederoesterreich': 'Niederösterreich'
   };
 
-  // ── Slug → Vermarktungsart Mapping ────────────────────────────
+  // ── Slug → Vermarktungsart Mapping (nur Kaufen und Mieten) ────────
   var slugToVermarktung = {
-    'kaufen':  'kaufen',
-    'mieten':  'mieten',
-    'anlage':  'anlage'
+    'kaufen': 'kaufen',
+    'mieten': 'mieten'
   };
-
   // ── Slug → Objektart Text Mapping (nur 4 erlaubte Typen) ───────
   var slugToObjektart = {
     'wohnung':               'wohnung',
