@@ -1,36 +1,29 @@
-name: Justimmo → Webflow Nacht-Sync
-
+name: Justimmo → Webflow Sync (stündlich)
 on:
   schedule:
-    # Täglich um 0:00 Uhr (UTC = 1:00 Uhr MEZ / 2:00 Uhr MESZ)
-    - cron: '0 23 * * *'
+    # Stündlich zur vollen Stunde
+    - cron: '0 * * * *'
   # Manuell ausführbar über GitHub UI
   workflow_dispatch:
-
 jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
     steps:
       - name: Repository auschecken
         uses: actions/checkout@v4
-
       - name: Python einrichten
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Abhängigkeiten installieren
         run: pip install requests
-
       - name: Justimmo → Webflow Sync ausführen
         env:
           JUSTIMMO_USER: ${{ secrets.JUSTIMMO_USER }}
           JUSTIMMO_PASS: ${{ secrets.JUSTIMMO_PASS }}
           WEBFLOW_TOKEN: ${{ secrets.WEBFLOW_TOKEN }}
         run: python sync.py
-
       - name: Log ausgeben
         if: always()
         run: cat /tmp/justimmo_sync.log || echo "Kein Log vorhanden"
