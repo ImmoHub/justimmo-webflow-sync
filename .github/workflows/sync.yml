@@ -23,7 +23,8 @@ jobs:
           JUSTIMMO_USER: ${{ secrets.JUSTIMMO_USER }}
           JUSTIMMO_PASS: ${{ secrets.JUSTIMMO_PASS }}
           WEBFLOW_TOKEN: ${{ secrets.WEBFLOW_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python sync.py
       - name: Log ausgeben
         if: always()
-        run: cat /tmp/justimmo_sync.log || echo "Kein Log vorhanden"
+        run: cat sync.log || echo "Kein Log vorhanden"
