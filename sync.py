@@ -111,9 +111,63 @@ def xml_float(element, path: str, default: float = 0.0) -> float:
 
 
 def strip_html(text: str) -> str:
+    """Einfaches HTML-Strippen (Legacy-Fallback)."""
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def html_to_structured_text(html: str) -> str:
+    """
+    Konvertiert HTML-Beschreibung aus Justimmo in strukturierten Plaintext.
+    Erhält Absätze, Aufzählungen, Überschriften und Fettschrift-Markierungen.
+    Verwendet \n\n als Absatztrenner und • für Listenelemente.
+    Das Frontend (JS) rendert daraus schönes HTML.
+    """
+    import re as _re
+    import html as _html
+
+    # HTML-Entities dekodieren
+    text = _html.unescape(html)
+
+    # Block-Elemente: Absatz-Trenner einfügen
+    # <p>, <div>, <br>, <h1>-<h6> → Zeilenumbrüche
+    text = _re.sub(r'<h[1-6][^>]*>', '\n\n## ', text, flags=_re.IGNORECASE)
+    text = _re.sub(r'</h[1-6]>', '\n\n', text, flags=_re.IGNORECASE)
+    text = _re.sub(r'<p[^>]*>', '\n\n', text, flags=_re.IGNORECASE)
+    text = _re.sub(r'</p>', '', text, flags=_re.IGNORECASE)
+    text = _re.sub(r'<br\s*/?>', '\n', text, flags=_re.IGNORECASE)
+    text = _re.sub(r'<div[^>]*>', '\n\n', text, flags=_re.IGNORECASE)
+    text = _re.sub(r'</div>', '', text, flags=_re.IGNORECASE)
+
+    # Listen: <li> → Bullet-Punkt
+    text = _re.sub(r'<li[^>]*>', '\n• ', text, flags=_re.IGNORECASE)
+    text = _re.sub(r'</li>', '', text, flags=_re.IGNORECASE)
+    text = _re.sub(r'<[uo]l[^>]*>', '\n', text, flags=_re.IGNORECASE)
+    text = _re.sub(r'</[uo]l>', '\n', text, flags=_re.IGNORECASE)
+
+    # Fettschrift: <strong>, <b> → **text** Marker
+    text = _re.sub(r'<(?:strong|b)[^>]*>', '**', text, flags=_re.IGNORECASE)
+    text = _re.sub(r'</(?:strong|b)>', '**', text, flags=_re.IGNORECASE)
+
+    # Unterstreichung: <u> → Marker für Abschnittstitel
+    text = _re.sub(r'<u[^>]*>', '§§', text, flags=_re.IGNORECASE)
+    text = _re.sub(r'</u>', '§§', text, flags=_re.IGNORECASE)
+
+    # Alle verbleibenden HTML-Tags entfernen
+    text = _re.sub(r'<[^>]+>', '', text)
+
+    # Mehrfache Leerzeilen auf max. 2 reduzieren
+    text = _re.sub(r'\n{3,}', '\n\n', text)
+
+    # Zeilen trimmen
+    lines = [l.rstrip() for l in text.split('\n')]
+    text = '\n'.join(lines)
+
+    # Führende/nachfolgende Leerzeilen entfernen
+    text = text.strip()
+
+    return text[:8000]
 
 
 # ─────────────────────────────────────────────
@@ -411,7 +465,19 @@ def map_realty_to_webflow(realty: ET.Element,
     # ── Titel & Beschreibung ──────────────────────────────────────
     titel = xml_text(realty, "freitexte/objekttitel") or f"Objekt {objektnr or objekt_id}"
     beschreibung_raw = xml_text(realty, "freitexte/objektbeschreibung")
-    beschreibung = strip_html(beschreibung_raw)[:5000] if beschreibung_raw else ""
+    ausstattung_raw  = xml_text(realty, "freitexte/ausstattung")
+    lage_raw         = xml_text(realty, "freitexte/lage")
+
+    # Alle Freitexte zusammenführen und strukturiert konvertieren
+    beschreibung_parts = []
+    if beschreibung_raw:
+        beschreibung_parts.append(html_to_structured_text(beschreibung_raw))
+    if ausstattung_raw:
+        beschreibung_parts.append("\n\n§§Ausstattung§§\n\n" + html_to_structured_text(ausstattung_raw))
+    if lage_raw:
+        beschreibung_parts.append("\n\n§§Lage & Infrastruktur§§\n\n" + html_to_structured_text(lage_raw))
+
+    beschreibung = "\n\n".join(beschreibung_parts).strip()[:8000] if beschreibung_parts else ""
 
     # ── Adresse ───────────────────────────────────────────────────
     plz  = xml_text(realty, "geo/plz")
