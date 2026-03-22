@@ -680,11 +680,14 @@ def sync(dry_run: bool = False, max_items: int = None):
             log.info(f"  [{i}/{len(all_ids)}] {titel} (Nr: {objektnr}, Ort: {ort}, Bundesland: {bundesland})")
 
             # Referenz-Items sicherstellen
-            # Typen: neue Typen werden angelegt falls noch nicht vorhanden
-            if objektart:
+            # Typen: NUR die 4 erlaubten Objekttypen verknüpfen, alle anderen ignorieren
+            ALLOWED_TYPES = {"Zinshaus / Renditeobjekt", "Haus", "Wohnung", "Grundstück"}
+            if objektart and objektart in ALLOWED_TYPES:
                 wf_id = ensure_reference_item(wf, COL_TYPES, objektart, type_map, dry_run)
                 if wf_id and wf_id not in created_ids[COL_TYPES]:
                     created_ids[COL_TYPES].append(wf_id)
+            elif objektart:
+                log.info(f"  Objekttyp '{objektart}' nicht in Whitelist – wird ignoriert")
             # Kategorien: NUR bestehende verwenden, KEINE neuen anlegen!
             if kategorie and kategorie in category_map:
                 if category_map[kategorie] not in created_ids[COL_CATEGORIES]:
