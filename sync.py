@@ -688,16 +688,22 @@ def sync(dry_run: bool = False, max_items: int = None):
                     created_ids[COL_TYPES].append(wf_id)
             elif objektart:
                 log.info(f"  Objekttyp '{objektart}' nicht in Whitelist – wird ignoriert")
-            # Kategorien: NUR bestehende verwenden, KEINE neuen anlegen!
-            if kategorie and kategorie in category_map:
+            # Kategorien: NUR Kaufen und Mieten erlaubt, Anlage ignorieren
+            ALLOWED_CATEGORIES = {"Kaufen", "Mieten"}
+            if kategorie and kategorie in ALLOWED_CATEGORIES and kategorie in category_map:
                 if category_map[kategorie] not in created_ids[COL_CATEGORIES]:
                     created_ids[COL_CATEGORIES].append(category_map[kategorie])
+            elif kategorie and kategorie not in ALLOWED_CATEGORIES:
+                log.info(f"  Kategorie '{kategorie}' nicht erlaubt – wird ignoriert")
             elif kategorie:
                 log.warning(f"  Kategorie '{kategorie}' nicht in Webflow gefunden – übersprungen")
-            # Standorte: Bundesland verwenden, NUR bestehende (Wien/NÖ/Bgld), KEINE neuen anlegen!
-            if bundesland and bundesland in location_map:
+            # Standorte: NUR Wien und Niederösterreich erlaubt
+            ALLOWED_LOCATIONS = {"Wien", "Niederösterreich"}
+            if bundesland and bundesland in ALLOWED_LOCATIONS and bundesland in location_map:
                 if location_map[bundesland] not in created_ids[COL_LOCATIONS]:
                     created_ids[COL_LOCATIONS].append(location_map[bundesland])
+            elif bundesland and bundesland not in ALLOWED_LOCATIONS:
+                log.info(f"  Bundesland '{bundesland}' nicht erlaubt – wird ignoriert")
             elif bundesland:
                 log.warning(f"  Bundesland '{bundesland}' nicht in Webflow gefunden – übersprungen")
 
