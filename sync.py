@@ -436,7 +436,8 @@ def map_realty_to_webflow(realty: ET.Element,
     # ── Flächen & Zimmer ──────────────────────────────────────────
     wohnflaeche  = xml_float(realty, "flaechen/wohnflaeche")
     nutzflaeche  = xml_float(realty, "flaechen/nutzflaeche")
-    grundflaeche = xml_float(realty, "flaechen/grundflaeche")
+    grundflaeche = (xml_float(realty, "flaechen/grundstuecksflaeche")
+                   or xml_float(realty, "flaechen/grundflaeche"))
     flaeche_val  = wohnflaeche or nutzflaeche or grundflaeche
     flaeche_str  = f"{flaeche_val:g} m²" if flaeche_val else ""
 
