@@ -547,6 +547,80 @@ def map_realty_to_webflow(realty: ET.Element,
 
 
 # ─────────────────────────────────────────────
+# filter-data.js auf GitHub pushen
+# ─────────────────────────────────────────────
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_REPO  = "ImmoHub/justimmo-webflow-sync"
+GITHUB_FILE  = "filter-data.js"
+
+
+def push_filter_data(wf: "WebflowClient", jm_id_map: dict, category_map: dict, location_map: dict):
+    """
+    Erstellt filter-data.js mit Slug → {k: kategorie, l: standort} Mapping
+    und pusht sie auf GitHub. Wird vom Frontend-Script geladen.
+    """
+    if not GITHUB_TOKEN:
+        log.warning("  GITHUB_TOKEN nicht gesetzt – filter-data.js wird nicht aktualisiert")
+        return
+
+    log.info("\n[6/6] Aktualisiere filter-data.js auf GitHub...")
+
+    try:
+        # Alle Properties mit Slug, Kategorie und Standort laden
+        items = wf.get_collection_items(COL_PROPERTIES)
+
+        # Umgekehrte Maps: ID → Name
+        cat_by_id = {v: k for k, v in category_map.items()}
+        loc_by_id = {v: k for k, v in location_map.items()}
+
+        mapping = {}
+        for item in items:
+            fd = item.get("fieldData", {})
+            slug = fd.get("slug", "")
+            cat_id = fd.get("property-categories", "")
+            loc_id = fd.get("property-locations", "")
+            if slug:
+                mapping[slug] = {
+                    "k": cat_by_id.get(cat_id, "").lower(),
+                    "l": loc_by_id.get(loc_id, "")
+                }
+
+        import json as _json
+        import base64 as _b64
+        js_content = f"window.IR_FILTER_DATA = {_json.dumps(mapping, ensure_ascii=False)};\n"
+
+        # SHA der bestehenden Datei holen
+        gh_headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        r = requests.get(
+            f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}",
+            headers=gh_headers, timeout=15
+        )
+        sha = r.json().get("sha") if r.status_code == 200 else None
+
+        payload = {
+            "message": f"filter-data.js: {len(mapping)} Immobilien",
+            "content": _b64.b64encode(js_content.encode()).decode()
+        }
+        if sha:
+            payload["sha"] = sha
+
+        r = requests.put(
+            f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}",
+            headers=gh_headers, json=payload, timeout=15
+        )
+        if r.status_code in (200, 201):
+            log.info(f"  ✓ filter-data.js aktualisiert ({len(mapping)} Einträge)")
+        else:
+            log.warning(f"  GitHub Push Fehler {r.status_code}: {r.text[:200]}")
+
+    except Exception as e:
+        log.warning(f"  filter-data.js Push fehlgeschlagen: {e}")
+
+
+# ─────────────────────────────────────────────
 # Hauptsynchronisation
 # ─────────────────────────────────────────────
 def sync(dry_run: bool = False, max_items: int = None):
@@ -668,6 +742,10 @@ def sync(dry_run: bool = False, max_items: int = None):
             for chunk in [ids[j:j+100] for j in range(0, len(ids), 100)]:
                 wf.publish_collection(col_id, chunk, dry_run)
             log.info(f"  Collection {col_id}: {len(ids)} Items veröffentlicht")
+
+    # ── Schritt 6: filter-data.js auf GitHub aktualisieren ────────
+    if not dry_run:
+        push_filter_data(wf, jm_id_map, category_map, location_map)
 
     # ── Zusammenfassung ────────────────────────────────────────────
     log.info("\n" + "=" * 60)
