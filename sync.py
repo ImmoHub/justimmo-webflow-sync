@@ -468,16 +468,16 @@ def map_realty_to_webflow(realty: ET.Element,
     ausstattung_raw  = xml_text(realty, "freitexte/ausstattung")
     lage_raw         = xml_text(realty, "freitexte/lage")
 
-    # Alle Freitexte zusammenführen und strukturiert konvertieren
+    # Alle Freitexte zusammenführen (plain text)
     beschreibung_parts = []
     if beschreibung_raw:
-        beschreibung_parts.append(html_to_structured_text(beschreibung_raw))
+        beschreibung_parts.append(strip_html(beschreibung_raw))
     if ausstattung_raw:
-        beschreibung_parts.append("\n\n§§Ausstattung§§\n\n" + html_to_structured_text(ausstattung_raw))
+        beschreibung_parts.append(strip_html(ausstattung_raw))
     if lage_raw:
-        beschreibung_parts.append("\n\n§§Lage & Infrastruktur§§\n\n" + html_to_structured_text(lage_raw))
+        beschreibung_parts.append(strip_html(lage_raw))
 
-    beschreibung = "\n\n".join(beschreibung_parts).strip()[:8000] if beschreibung_parts else ""
+    beschreibung = " ".join(beschreibung_parts).strip()[:8000] if beschreibung_parts else ""
 
     # ── Adresse ───────────────────────────────────────────────────
     plz  = xml_text(realty, "geo/plz")
