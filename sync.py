@@ -367,6 +367,19 @@ class WebflowClient:
         if not resp.ok:
             log.warning(f"  Veröffentlichung fehlgeschlagen: {resp.status_code} – {resp.text[:200]}")
 
+    def delete_item(self, collection_id: str, item_id: str, dry_run: bool = False) -> bool:
+        if dry_run:
+            log.info(f"  [DRY-RUN] Würde löschen: {item_id}")
+            return True
+        self._throttle()
+        resp = self.session.delete(
+            f"{WEBFLOW_BASE}/collections/{collection_id}/items/{item_id}"
+        )
+        if resp.ok:
+            return True
+        log.error(f"  Fehler beim Löschen {item_id}: {resp.status_code} – {resp.text[:200]}")
+        return False
+
 
 # ─────────────────────────────────────────────
 # Lookup-Maps
@@ -811,15 +824,30 @@ def sync(dry_run: bool = False, max_items: int = None):
 
         time.sleep(0.3)
 
-    # ── Schritt 5: Veröffentlichen ─────────────────────────────────
-    log.info("\n[5/5] Veröffentliche geänderte Items...")
+    # ── Schritt 5: Deaktivierte Objekte löschen ──────────────────────
+    log.info("\n[5/6] Lösche deaktivierte Objekte aus Webflow...")
+    active_jm_ids = set(all_ids)  # alle aktiven Justimmo-IDs
+    deleted_count = 0
+    for jm_id, wf_item_id in list(jm_id_map.items()):
+        if jm_id not in active_jm_ids:
+            log.info(f"  Lösche deaktiviertes Objekt: Justimmo-ID {jm_id} (Webflow: {wf_item_id})")
+            if wf.delete_item(COL_PROPERTIES, wf_item_id, dry_run):
+                stats["geloescht"] = stats.get("geloescht", 0) + 1
+                deleted_count += 1
+                del jm_id_map[jm_id]
+            else:
+                stats["fehler"] += 1
+    log.info(f"  {deleted_count} deaktivierte Objekte gelöscht")
+
+    # ── Schritt 6: Veröffentlichen ─────────────────────────────
+    log.info("\n[6/6] Veröffentliche geänderte Items...")
     for col_id, ids in created_ids.items():
         if ids:
             for chunk in [ids[j:j+100] for j in range(0, len(ids), 100)]:
                 wf.publish_collection(col_id, chunk, dry_run)
             log.info(f"  Collection {col_id}: {len(ids)} Items veröffentlicht")
 
-    # ── Schritt 6: filter-data.js auf GitHub aktualisieren ────────
+    # ── Schritt 7: filter-data.js auf GitHub aktualisieren ────
     if not dry_run:
         push_filter_data(wf, jm_id_map, category_map, location_map)
 
@@ -828,6 +856,7 @@ def sync(dry_run: bool = False, max_items: int = None):
     log.info("SYNC ABGESCHLOSSEN")
     log.info(f"  Neu erstellt:    {stats['neu']}")
     log.info(f"  Aktualisiert:    {stats['aktualisiert']}")
+    log.info(f"  Gelöscht:        {stats.get('geloescht', 0)}")
     log.info(f"  Fehler:          {stats['fehler']}")
     log.info("=" * 60)
 
