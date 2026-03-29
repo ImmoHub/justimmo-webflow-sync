@@ -396,14 +396,20 @@ def build_lookup_map(wf: WebflowClient, collection_id: str, key_field: str = "na
 
 
 def build_justimmo_id_map(wf: WebflowClient) -> tuple:
+    """
+    Baut eine Map: Justimmo-ID → Webflow-Item-ID.
+    Da das Feld 'justimmo-id' in Webflow entfernt wurde, nutzen wir
+    'objektnummer' als eindeutigen Schlüssel (entspricht objektnr_extern).
+    """
     items = wf.get_collection_items(COL_PROPERTIES)
     jm_map = {}
     featured_map = {}
     for item in items:
         fd = item.get("fieldData", {})
-        jm_id = fd.get("justimmo-id", "")
-        if jm_id:
-            jm_map[str(jm_id)] = item["id"]
+        # Primär: objektnummer (= objektnr_extern aus Justimmo)
+        objektnr = fd.get("objektnummer", "")
+        if objektnr:
+            jm_map[str(objektnr)] = item["id"]
         featured_map[item["id"]] = fd.get("feature-property", False)
     return jm_map, featured_map
 
@@ -579,6 +585,9 @@ def map_realty_to_webflow(realty: ET.Element,
     bk_raw    = xml_text(realty, "preise/zusatzkosten/betriebskosten/brutto")
 
     # ── field_data zusammenstellen ────────────────────────────────
+    # HINWEIS: Felder müssen exakt den Webflow CMS Slugs entsprechen.
+    # Entfernte Felder (nicht mehr in Webflow): justimmo-id, baujahr, verfuegbar-ab, betriebskosten, etage
+    # Stattdessen: justimmo-id → in feature-1 als Fallback, oder einfach weggelassen
     field_data = {
         "name":               titel,
         "property-location":  location_str,
@@ -588,7 +597,6 @@ def map_realty_to_webflow(realty: ET.Element,
         "property-bathrooms": baeder,
         "property-parking":   parking,
         "feature-property":   False,
-        "justimmo-id":        objekt_id,
         "objektnummer":       objektnr,
     }
 
@@ -612,16 +620,21 @@ def map_realty_to_webflow(realty: ET.Element,
     if agent_wf_id:
         field_data["agent-detail"] = agent_wf_id
 
-    # Optionale Felder
-    if etage:      field_data["etage"]        = etage
-    if baujahr:    field_data["baujahr"]       = baujahr
-    if verfuegbar: field_data["verfuegbar-ab"] = verfuegbar
-    if provision:  field_data["provision"]     = provision
+    # Optionale Felder (nur Felder die in Webflow existieren)
+    if provision:  field_data["provision"] = provision
+
+    # Merkmale: Baujahr, Etage, Verfügbar ab, Betriebskosten → feature-1..5
+    merkmale = []
+    if baujahr:    merkmale.append(f"Baujahr: {baujahr}")
+    if etage:      merkmale.append(f"Etage: {etage}")
+    if verfuegbar: merkmale.append(f"Verfügbar ab: {verfuegbar}")
     if bk_raw:
         try:
-            field_data["betriebskosten"] = f"€ {float(bk_raw):,.2f}"
+            merkmale.append(f"Betriebskosten: € {float(bk_raw):,.2f}")
         except ValueError:
-            field_data["betriebskosten"] = bk_raw
+            merkmale.append(f"Betriebskosten: {bk_raw}")
+    for idx, merkmal in enumerate(merkmale[:5], 1):
+        field_data[f"feature-{idx}"] = merkmal
 
     return field_data
 
@@ -737,6 +750,8 @@ def sync(dry_run: bool = False, max_items: int = None):
     log.info("\n[4/5] Synchronisiere Immobilien...")
     stats = {"neu": 0, "aktualisiert": 0, "fehler": 0}
 
+    active_lookup_keys = set()  # für Schritt 5 (Löschen)
+
     for i, objekt_id in enumerate(all_ids, 1):
         log.info(f"  [{i}/{len(all_ids)}] Lade Detail für ID {objekt_id}...")
 
@@ -793,9 +808,13 @@ def sync(dry_run: bool = False, max_items: int = None):
                 wf.headers, dry_run
             )
 
-            if objekt_id in jm_id_map:
+            # Lookup-Key: objektnummer (eindeutig, stabil)
+            lookup_key = str(objektnr) if objektnr else str(objekt_id)
+            active_lookup_keys.add(lookup_key)  # für Schritt 5
+
+            if lookup_key in jm_id_map:
                 # Aktualisieren – Slug NICHT senden!
-                item_id = jm_id_map[objekt_id]
+                item_id = jm_id_map[lookup_key]
                 field_data["feature-property"] = featured_map.get(item_id, False)
                 field_data.pop("slug", None)
                 result = wf.update_item(COL_PROPERTIES, item_id, field_data, dry_run)
@@ -812,7 +831,7 @@ def sync(dry_run: bool = False, max_items: int = None):
                 result = wf.create_item(COL_PROPERTIES, field_data, dry_run)
                 if result and result.get("id"):
                     stats["neu"] += 1
-                    jm_id_map[objekt_id] = result["id"]
+                    jm_id_map[lookup_key] = result["id"]
                     created_ids[COL_PROPERTIES].append(result["id"])
                     log.info(f"  ✓ Neu angelegt: {titel}")
                 else:
@@ -824,21 +843,20 @@ def sync(dry_run: bool = False, max_items: int = None):
 
         time.sleep(0.3)
 
-    # ── Schritt 5: Deaktivierte Objekte löschen ──────────────────────
+    # ── Schritt 5: Deaktivierte Objekte löschen ────────────────────
     log.info("\n[5/6] Lösche deaktivierte Objekte aus Webflow...")
-    active_jm_ids = set(all_ids)  # alle aktiven Justimmo-IDs
+    # active_lookup_keys wurde in Schritt 4 befüllt (keine extra API-Calls nötig)
     deleted_count = 0
-    for jm_id, wf_item_id in list(jm_id_map.items()):
-        if jm_id not in active_jm_ids:
-            log.info(f"  Lösche deaktiviertes Objekt: Justimmo-ID {jm_id} (Webflow: {wf_item_id})")
+    for lookup_key_del, wf_item_id in list(jm_id_map.items()):
+        if lookup_key_del not in active_lookup_keys:
+            log.info(f"  Lösche deaktiviertes Objekt: Key {lookup_key_del} (Webflow: {wf_item_id})")
             if wf.delete_item(COL_PROPERTIES, wf_item_id, dry_run):
                 stats["geloescht"] = stats.get("geloescht", 0) + 1
                 deleted_count += 1
-                del jm_id_map[jm_id]
+                del jm_id_map[lookup_key_del]
             else:
                 stats["fehler"] += 1
     log.info(f"  {deleted_count} deaktivierte Objekte gelöscht")
-
     # ── Schritt 6: Veröffentlichen ─────────────────────────────
     log.info("\n[6/6] Veröffentliche geänderte Items...")
     for col_id, ids in created_ids.items():
