@@ -588,7 +588,6 @@ def map_realty_to_webflow(realty: ET.Element,
         "property-bathrooms": baeder,
         "property-parking":   parking,
         "feature-property":   False,
-        "justimmo-id":        objekt_id,
         "objektnummer":       objektnr,
     }
 
@@ -612,16 +611,9 @@ def map_realty_to_webflow(realty: ET.Element,
     if agent_wf_id:
         field_data["agent-detail"] = agent_wf_id
 
-    # Optionale Felder
-    if etage:      field_data["etage"]        = etage
-    if baujahr:    field_data["baujahr"]       = baujahr
-    if verfuegbar: field_data["verfuegbar-ab"] = verfuegbar
-    if provision:  field_data["provision"]     = provision
-    if bk_raw:
-        try:
-            field_data["betriebskosten"] = f"€ {float(bk_raw):,.2f}"
-        except ValueError:
-            field_data["betriebskosten"] = bk_raw
+    # Optionale Felder (nur Felder die in Webflow existieren)
+    # Entfernt: etage, baujahr, verfuegbar-ab, betriebskosten (Felder in Webflow gelöscht am 24.03.2026)
+    if provision:  field_data["provision"] = provision
 
     return field_data
 
