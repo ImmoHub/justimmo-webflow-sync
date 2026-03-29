@@ -454,6 +454,9 @@ def extract_images(realty: ET.Element) -> tuple:
     cover_url = titelbild_urls[0] if titelbild_urls else None
     # BILD[0] ist immer das Agenten-PNG → überspringen!
     galerie_urls = bild_urls[1:] if len(bild_urls) > 1 else bild_urls
+    # Fallback: kein Titelbild → erstes verfügbares Galerie-Bild als Cover verwenden
+    if not cover_url and galerie_urls:
+        cover_url = galerie_urls[0]
 
     return cover_url, galerie_urls
 
