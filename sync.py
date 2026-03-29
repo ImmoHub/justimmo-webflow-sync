@@ -245,8 +245,9 @@ def upload_image_to_webflow(img_url: str, filename: str, wf_headers: dict) -> Op
         # CDN-URL konstruieren (Webflow CDN-Muster: cdn.prod.website-files.com/{siteId}/{assetId}_{filename})
         cdn_url = f"https://cdn.prod.website-files.com/{WEBFLOW_SITE_ID}/{asset_id}_{filename}"
         
-        log.info(f"    ✓ Bild hochgeladen: {filename} ({len(img_data)//1024}KB) → {asset_id[:12]}...")
-        return {"url": cdn_url}
+        log.info(f"    \u2713 Bild hochgeladen: {filename} ({len(img_data)//1024}KB) \u2192 {asset_id[:12]}...")
+        # Webflow benötigt fileId UND url für Image-Felder
+        return {"fileId": asset_id, "url": cdn_url}
 
     except Exception as e:
         log.warning(f"    Upload-Fehler für {img_url[-50:]}: {e}")
