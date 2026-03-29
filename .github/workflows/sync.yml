@@ -1,8 +1,8 @@
-name: Justimmo → Webflow Sync (stündlich)
+name: Justimmo → Webflow Sync (alle 6 Stunden)
 on:
   schedule:
-    # Stündlich zur vollen Stunde
-    - cron: '0 * * * *'
+    # Alle 6 Stunden (0:00, 6:00, 12:00, 18:00 UTC)
+    - cron: '0 */6 * * *'
   # Manuell ausführbar über GitHub UI
   workflow_dispatch:
 jobs:
