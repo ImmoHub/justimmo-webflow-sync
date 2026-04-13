@@ -817,7 +817,8 @@ def sync(dry_run: bool = False, max_items: int = None):
                     stats["fehler"] += 1
             else:
                 # Neu erstellen – Slug nur beim Create
-                slug = slugify(f"immobilie-{objektnr or objekt_id}")
+                # Slug basiert auf interner Justimmo-ID (objekt_id) damit filter-data.js passt
+                slug = f"immobilie-{objekt_id}"
                 field_data["slug"] = slug
                 result = wf.create_item(COL_PROPERTIES, field_data, dry_run)
                 if result and result.get("id"):
