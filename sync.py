@@ -397,15 +397,27 @@ def build_lookup_map(wf: WebflowClient, collection_id: str, key_field: str = "na
 
 
 def build_justimmo_id_map(wf: WebflowClient) -> tuple:
+    """
+    Baut eine Map: objektnummer (extern) -> Webflow-Item-ID
+    Verwendet 'objektnummer' als Schlüssel (das einzige verlässliche Feld in Webflow).
+    Bei Duplikaten wird das älteste Item behalten (niedrigster createdOn-Wert).
+    """
     items = wf.get_collection_items(COL_PROPERTIES)
-    jm_map = {}
-    featured_map = {}
+    jm_map = {}       # objektnummer -> webflow item id
+    featured_map = {} # webflow item id -> feature-property bool
+    seen = {}         # objektnummer -> (createdOn, webflow item id) für Duplikat-Handling
     for item in items:
         fd = item.get("fieldData", {})
-        jm_id = fd.get("justimmo-id", "")
-        if jm_id:
-            jm_map[str(jm_id)] = item["id"]
-        featured_map[item["id"]] = fd.get("feature-property", False)
+        objektnr = str(fd.get("objektnummer", "")).strip()
+        item_id = item["id"]
+        created = item.get("createdOn", "")
+        featured_map[item_id] = fd.get("feature-property", False)
+        if objektnr:
+            if objektnr not in seen or created < seen[objektnr][0]:
+                seen[objektnr] = (created, item_id)
+    for objektnr, (_, item_id) in seen.items():
+        jm_map[objektnr] = item_id
+    log.info(f"  Webflow-Map aufgebaut: {len(jm_map)} eindeutige Objektnummern aus {len(items)} Items")
     return jm_map, featured_map
 
 
@@ -789,9 +801,11 @@ def sync(dry_run: bool = False, max_items: int = None):
                 wf.headers, dry_run
             )
 
-            if objekt_id in jm_id_map:
+            # Vergleich anhand objektnummer (extern) – das verlässliche Feld in Webflow
+            lookup_key = objektnr or objekt_id
+            if lookup_key in jm_id_map:
                 # Aktualisieren – Slug NICHT senden!
-                item_id = jm_id_map[objekt_id]
+                item_id = jm_id_map[lookup_key]
                 field_data["feature-property"] = featured_map.get(item_id, False)
                 field_data.pop("slug", None)
                 result = wf.update_item(COL_PROPERTIES, item_id, field_data, dry_run)
@@ -808,7 +822,7 @@ def sync(dry_run: bool = False, max_items: int = None):
                 result = wf.create_item(COL_PROPERTIES, field_data, dry_run)
                 if result and result.get("id"):
                     stats["neu"] += 1
-                    jm_id_map[objekt_id] = result["id"]
+                    jm_id_map[lookup_key] = result["id"]
                     created_ids[COL_PROPERTIES].append(result["id"])
                     log.info(f"  ✓ Neu angelegt: {titel}")
                 else:
@@ -822,15 +836,24 @@ def sync(dry_run: bool = False, max_items: int = None):
 
     # ── Schritt 5: Deaktivierte Objekte löschen ──────────────────────
     log.info("\n[5/6] Lösche deaktivierte Objekte aus Webflow...")
-    active_jm_ids = set(all_ids)  # alle aktiven Justimmo-IDs
+    # Aktive Objektnummern (extern) aus den gerade synchronisierten Objekten
+    active_objektnummern = set()
+    for oid in all_ids:
+        r = jm.get_realty_detail(oid)
+        if r is not None:
+            ext = xml_text(r, "verwaltung_techn/objektnr_extern")
+            if ext:
+                active_objektnummern.add(ext.strip())
+            else:
+                active_objektnummern.add(oid)  # Fallback: interne ID
     deleted_count = 0
-    for jm_id, wf_item_id in list(jm_id_map.items()):
-        if jm_id not in active_jm_ids:
-            log.info(f"  Lösche deaktiviertes Objekt: Justimmo-ID {jm_id} (Webflow: {wf_item_id})")
+    for objektnr_key, wf_item_id in list(jm_id_map.items()):
+        if objektnr_key not in active_objektnummern:
+            log.info(f"  Lösche deaktiviertes Objekt: Nr {objektnr_key} (Webflow: {wf_item_id})")
             if wf.delete_item(COL_PROPERTIES, wf_item_id, dry_run):
                 stats["geloescht"] = stats.get("geloescht", 0) + 1
                 deleted_count += 1
-                del jm_id_map[jm_id]
+                del jm_id_map[objektnr_key]
             else:
                 stats["fehler"] += 1
     log.info(f"  {deleted_count} deaktivierte Objekte gelöscht")
